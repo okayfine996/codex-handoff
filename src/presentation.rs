@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use codex_handoff::{
     LocalHealth, ProfileListEntry, ProfileMetadata, ResetCredits, UsageBucket, UsageReport,
     UsageStatus, UsageWindow,
@@ -112,7 +112,7 @@ fn render_account(
         paint("Last synced", Accent::Muted, colors),
         account
             .last_synced_at
-            .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M UTC").to_string())
+            .map(format_sync_timestamp)
             .unwrap_or_else(|| "<unavailable>".into()),
         paint("Health", Accent::Muted, colors),
         account.health
@@ -200,8 +200,8 @@ fn compact_usage(report: &UsageReport, width: u16, colors: bool) -> String {
             lines.extend(wrap_with_indent(&summary, 4, width));
             let reset = window
                 .resets_at
-                .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
-                .map(|timestamp| timestamp.format("resets %b %-d %H:%M UTC").to_string());
+                .and_then(format_reset_timestamp)
+                .map(|timestamp| format!("resets {timestamp}"));
             let duration = window
                 .window_duration_mins
                 .map(|minutes| format!("window {}", format_duration(minutes)));
@@ -245,8 +245,7 @@ fn add_window_row(
     let remaining = format!("{}%", 100 - window.used_percent);
     let reset = window
         .resets_at
-        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
-        .map(|timestamp| timestamp.format("%b %-d %H:%M UTC").to_string())
+        .and_then(format_reset_timestamp)
         .unwrap_or_else(|| "—".into());
     let duration = window
         .window_duration_mins
@@ -325,6 +324,22 @@ fn window_label(bucket: &UsageBucket, slot: &str) -> String {
 
 fn progress_bar(used_percent: u8) -> String {
     progress_bar_with_width(used_percent, PROGRESS_WIDTH)
+}
+
+fn format_sync_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M %Z")
+        .to_string()
+}
+
+fn format_reset_timestamp(seconds: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(seconds, 0).map(|timestamp| {
+        timestamp
+            .with_timezone(&Local)
+            .format("%b %-d %H:%M %Z")
+            .to_string()
+    })
 }
 
 fn progress_bar_with_width(used_percent: u8, width: usize) -> String {
@@ -454,7 +469,7 @@ enum Accent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, TimeZone, Utc};
     use codex_handoff::{
         LocalHealth, ProfileListEntry, ProfileMetadata, ProfileName, ResetCredit, ResetCredits,
         UsageBucket, UsageReport, UsageStatus, UsageWindow,
@@ -536,6 +551,52 @@ mod tests {
         assert!(output.contains("Usage unavailable"));
         assert!(output.contains("Codex rejected the usage request"));
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_sync_and_reset_times_in_the_system_local_timezone() {
+        let synced_at = Utc.with_ymd_and_hms(2026, 8, 29, 11, 35, 0).unwrap();
+        let resets_at = 1_788_021_409;
+        let profile = ProfileListEntry {
+            name: ProfileName::parse("personal").unwrap(),
+            metadata: Some(ProfileMetadata {
+                schema_version: 1,
+                name: ProfileName::parse("personal").unwrap(),
+                email: "personal@example.com".into(),
+                created_at: synced_at,
+                last_synced_at: synced_at,
+            }),
+            active: true,
+            health: LocalHealth::Healthy,
+            usage: UsageStatus::Available(UsageReport {
+                buckets: vec![UsageBucket {
+                    id: "codex".into(),
+                    primary: Some(UsageWindow {
+                        used_percent: 18,
+                        resets_at: Some(resets_at),
+                        window_duration_mins: Some(300),
+                    }),
+                    secondary: None,
+                    reached_type: None,
+                    spend_control_reached: None,
+                }],
+                reset_credits: None,
+            }),
+        };
+
+        let output = render_profile(&profile, 88, ColorMode::Never);
+        let expected_sync = synced_at
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M %Z")
+            .to_string();
+        let expected_reset = DateTime::<Utc>::from_timestamp(resets_at, 0)
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%b %-d %H:%M %Z")
+            .to_string();
+
+        assert!(output.contains(&expected_sync));
+        assert!(output.contains(&expected_reset));
     }
 
     #[test]
