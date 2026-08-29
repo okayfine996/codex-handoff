@@ -59,9 +59,10 @@ also shows reset times, reached limits, spend-control warnings, and available
 reset credits.
 
 `ch status` uses the same dashboard for only the active live account. A quota
-query does not write either the live or vault authentication file. If one
-account's remote query fails, `ch` displays `Usage unavailable` for that
-profile without affecting the other accounts or any switching operation.
+query refreshes credentials only inside its isolated temporary `CODEX_HOME`;
+it never writes the live or vault authentication file. If one account's remote
+query fails, `ch` displays `Usage unavailable` for that profile without
+affecting the other accounts or any switching operation.
 
 Color is enabled only in an interactive terminal. Piped or redirected output,
 and environments with `NO_COLOR` set, remain plain text with no ANSI escape
@@ -95,6 +96,14 @@ CODEX_HOME=/tmp/codex CODEX_HANDOFF_HOME=/tmp/codex-handoff ch status
   snapshots, and an OS advisory lock.
 - `add` and `relogin` never call `logout`; they temporarily preserve and then
   restore the active account.
+
+If `doctor` reports insecure credentials, remove group/other permissions from
+the affected file before retrying. For the default paths:
+
+```sh
+chmod 600 ~/.codex/auth.json
+chmod 700 ~/.codex-handoff ~/.codex-handoff/profiles ~/.codex-handoff/profiles/*
+```
 
 This first release deliberately does not delete profiles, rotate accounts,
 keep tokens alive, synchronize vaults between machines, or restart Codex

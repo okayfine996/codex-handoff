@@ -111,6 +111,8 @@ pub enum HandoffError {
     },
     #[error("Codex or ChatGPT is running; close it before switching, or pass --force")]
     ClientRunning,
+    #[error("could not check whether Codex or ChatGPT is running: {0}")]
+    ClientCheckFailed(String),
     #[error("--force and --close-clients cannot be used together")]
     ConflictingProcessOptions,
     #[error("could not request graceful shutdown for: {0}")]
@@ -362,13 +364,7 @@ impl ClientProcess {
 
 impl ProcessGuard for SystemProcessGuard {
     fn ensure_stopped(&self, force: bool) -> Result<(), HandoffError> {
-        if force {
-            return Ok(());
-        }
-        if !self.running_clients().unwrap_or_default().is_empty() {
-            return Err(HandoffError::ClientRunning);
-        }
-        Ok(())
+        ensure_clients_stopped(force, || self.running_clients())
     }
 
     fn close_gracefully(&self) -> Result<(), HandoffError> {
@@ -424,12 +420,26 @@ impl SystemProcessGuard {
                     clients.push(ClientProcess { name, pid });
                 }
             } else if output.status.code() != Some(1) {
-                return Err(HandoffError::ClientShutdownFailed(format!(
-                    "process lookup for {name}"
+                return Err(HandoffError::ClientCheckFailed(format!(
+                    "process lookup for {name} failed"
                 )));
             }
         }
         Ok(clients)
+    }
+}
+
+fn ensure_clients_stopped(
+    force: bool,
+    running_clients: impl FnOnce() -> Result<Vec<ClientProcess>, HandoffError>,
+) -> Result<(), HandoffError> {
+    if force {
+        return Ok(());
+    }
+    if running_clients()?.is_empty() {
+        Ok(())
+    } else {
+        Err(HandoffError::ClientRunning)
     }
 }
 
@@ -669,12 +679,39 @@ impl UsageReader for AppServerUsageReader {
             writeln!(
                 stdin,
                 "{}",
-                serde_json::json!({"method":"account/rateLimits/read","id":2})
+                serde_json::json!({
+                    "method":"account/read",
+                    "id":2,
+                    "params":{"refreshToken":true}
+                })
             )?;
-            let response = receive(2)?;
-            if response.get("error").is_some() {
+            let account = receive(2)?;
+            if account.get("error").is_some() {
+                return Err(usage_rpc_error(
+                    "Codex rejected the authentication refresh",
+                    &account,
+                ));
+            }
+            if account
+                .pointer("/result/account/type")
+                .and_then(serde_json::Value::as_str)
+                != Some("chatgpt")
+            {
                 return Err(HandoffError::Usage(
-                    "Codex rejected the usage request".into(),
+                    "Codex did not verify ChatGPT authentication".into(),
+                ));
+            }
+            parse_auth(&fs::read(&auth_path)?)?;
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"method":"account/rateLimits/read","id":3})
+            )?;
+            let response = receive(3)?;
+            if response.get("error").is_some() {
+                return Err(usage_rpc_error(
+                    "Codex rejected the usage request",
+                    &response,
                 ));
             }
             parse_usage_report(
@@ -687,6 +724,15 @@ impl UsageReader for AppServerUsageReader {
         let _ = child.wait();
         report
     }
+}
+
+fn usage_rpc_error(context: &str, response: &serde_json::Value) -> HandoffError {
+    let message = response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_i64)
+        .map(|code| format!("{context} (JSON-RPC code {code})"))
+        .unwrap_or_else(|| context.into());
+    HandoffError::Usage(message)
 }
 
 fn parse_usage_report(value: &serde_json::Value) -> Result<UsageReport, HandoffError> {
@@ -955,11 +1001,12 @@ impl App {
         if self.paths.state_path().exists() {
             return Err(HandoffError::ProfileExists(name.as_str().into()));
         }
+        self.remove_empty_profile_dir(&name)?;
         if self.paths.profile_dir(&name).exists() {
             return Err(HandoffError::ProfileExists(name.as_str().into()));
         }
         let metadata = self.new_metadata(name.clone(), &auth)?;
-        self.transaction(
+        let result = self.transaction(
             vec![
                 self.paths.profile_auth_path(&name),
                 self.paths.profile_metadata_path(&name),
@@ -969,10 +1016,20 @@ impl App {
                 self.save_profile(&metadata, &auth)?;
                 self.save_state(&State {
                     schema_version: SCHEMA_VERSION,
-                    active_profile: name,
+                    active_profile: name.clone(),
                 })
             },
-        )
+        );
+        if let Err(operation_error) = result {
+            return match self.remove_empty_profile_dir(&name) {
+                Ok(()) => Err(operation_error),
+                Err(rollback_error) => Err(HandoffError::Rollback {
+                    operation: operation_error.to_string(),
+                    rollback: rollback_error.to_string(),
+                }),
+            };
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> Result<Status, HandoffError> {
@@ -1357,10 +1414,12 @@ impl App {
         if !path.is_file() {
             return Err(HandoffError::LiveAuthMissing(path.display().to_string()));
         }
+        ensure_private_file_path(&path)?;
         self.read_auth(&path)
     }
 
     fn read_profile_auth(&self, name: &ProfileName) -> Result<Vec<u8>, HandoffError> {
+        self.ensure_private_profile_dir(name)?;
         let path = self.paths.profile_auth_path(name);
         ensure_private_file_path(&path)?;
         self.read_auth(&path)
@@ -1413,6 +1472,7 @@ impl App {
     }
 
     fn load_profile(&self, name: &ProfileName) -> Result<ProfileMetadata, HandoffError> {
+        self.ensure_private_profile_dir(name)?;
         let path = self.paths.profile_metadata_path(name);
         if !path.is_file() {
             return Err(HandoffError::ProfileMissing(name.as_str().into()));
@@ -1425,6 +1485,14 @@ impl App {
             ));
         }
         Ok(profile)
+    }
+
+    fn ensure_private_profile_dir(&self, name: &ProfileName) -> Result<(), HandoffError> {
+        let path = self.paths.profile_dir(name);
+        if !path.is_dir() {
+            return Err(HandoffError::ProfileMissing(name.as_str().into()));
+        }
+        ensure_private_dir_path(&path)
     }
 
     fn save_metadata(&self, profile: &ProfileMetadata) -> Result<(), HandoffError> {
@@ -1524,6 +1592,20 @@ fn ensure_private_file_path(path: &Path) -> Result<(), HandoffError> {
     Ok(())
 }
 
+fn ensure_private_dir_path(path: &Path) -> Result<(), HandoffError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(HandoffError::InsecurePermissions(
+                path.display().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn private_path_is_safe(path: &Path, directory: bool) -> bool {
     if directory != path.is_dir() {
         return false;
@@ -1594,7 +1676,7 @@ mod tests {
     use super::{
         App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, HandoffError, LoginRunner,
         NoopProcessGuard, ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader,
-        UsageReport, UsageStatus, UsageWindow,
+        UsageReport, UsageStatus, UsageWindow, ensure_clients_stopped,
     };
     use std::{
         fs,
@@ -1645,7 +1727,13 @@ mod tests {
 
     impl LoginRunner for FakeLogin {
         fn login(&self, codex_home: &Path) -> Result<(), HandoffError> {
-            fs::write(codex_home.join("auth.json"), &self.0)?;
+            let auth_path = codex_home.join("auth.json");
+            fs::write(&auth_path, &self.0)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+            }
             Ok(())
         }
     }
@@ -1720,6 +1808,20 @@ mod tests {
         (temporary, app)
     }
 
+    fn write_live_auth(app: &App, bytes: &[u8]) {
+        fs::create_dir_all(app.paths().codex_home()).unwrap();
+        fs::write(app.paths().live_auth_path(), bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                app.paths().live_auth_path(),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn accepts_safe_profile_names() {
         assert!(ProfileName::parse("personal.work_1").is_ok());
@@ -1732,14 +1834,27 @@ mod tests {
     }
 
     #[test]
+    fn client_process_lookup_failures_are_reported_unless_forced() {
+        let error = ensure_clients_stopped(false, || {
+            Err(HandoffError::ClientCheckFailed("pgrep unavailable".into()))
+        });
+        assert!(matches!(error, Err(HandoffError::ClientCheckFailed(_))));
+
+        let looked_up = AtomicBool::new(false);
+        ensure_clients_stopped(true, || {
+            looked_up.store(true, Ordering::SeqCst);
+            Err(HandoffError::ClientCheckFailed(
+                "should not be called".into(),
+            ))
+        })
+        .unwrap();
+        assert!(!looked_up.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn init_creates_a_private_profile_and_records_the_email() {
         let (_temporary, app) = app();
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
 
         app.init().unwrap();
 
@@ -1755,18 +1870,28 @@ mod tests {
     #[test]
     fn init_derives_the_profile_name_from_the_email_local_part() {
         let (_temporary, app) = app();
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("litesky+codex@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("litesky+codex@example.com", 1));
 
         app.init().unwrap();
 
         let status = app.status().unwrap();
         assert_eq!(status.active.name.as_str(), "litesky-codex");
         assert_eq!(status.active.email, "litesky+codex@example.com");
+    }
+
+    #[test]
+    fn init_recovers_from_an_empty_profile_directory() {
+        let (_temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        fs::create_dir_all(
+            app.paths()
+                .profile_dir(&ProfileName::parse("personal").unwrap()),
+        )
+        .unwrap();
+
+        app.init().unwrap();
+
+        assert_eq!(app.status().unwrap().active.name.as_str(), "personal");
     }
 
     #[test]
@@ -1781,12 +1906,7 @@ mod tests {
             Box::new(StaticProbe::success()),
             Box::new(RejectingProcessGuard),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
 
         app.init().unwrap();
 
@@ -1796,15 +1916,10 @@ mod tests {
     #[test]
     fn sync_preserves_the_latest_live_authentication_bytes() {
         let (_temporary, app) = app();
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let refreshed = auth("personal@example.com", 2);
-        fs::write(app.paths().live_auth_path(), &refreshed).unwrap();
+        write_live_auth(&app, &refreshed);
 
         app.sync(false).unwrap();
 
@@ -1821,19 +1936,14 @@ mod tests {
     #[test]
     fn switch_saves_the_refreshed_source_before_activating_the_target() {
         let (_temporary, app) = app();
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
         let work_metadata = app.new_metadata(work.clone(), &work_auth).unwrap();
         app.save_profile(&work_metadata, &work_auth).unwrap();
         let refreshed_personal = auth("personal@example.com", 2);
-        fs::write(app.paths().live_auth_path(), &refreshed_personal).unwrap();
+        write_live_auth(&app, &refreshed_personal);
 
         app.switch(work.clone(), false).unwrap();
 
@@ -1862,12 +1972,7 @@ mod tests {
             Box::new(StaticProbe::success()),
             Box::new(guard.clone()),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
@@ -1893,12 +1998,7 @@ mod tests {
             Box::new(NoopProcessGuard),
         )
         .with_usage_reader(Box::new(FakeUsageReader));
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
@@ -1932,12 +2032,7 @@ mod tests {
             Box::new(NoopProcessGuard),
         )
         .with_usage_reader(Box::new(FakeUsageReader));
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
 
         assert!(matches!(
@@ -1960,12 +2055,7 @@ mod tests {
             Box::new(NoopProcessGuard),
         )
         .with_usage_reader(Box::new(CountingUsageReader(usage_was_read.clone())));
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
 
         app.doctor();
@@ -1985,9 +2075,8 @@ mod tests {
             Box::new(StaticProbe::failure("expired")),
             Box::new(NoopProcessGuard),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
         let personal_auth = auth("personal@example.com", 1);
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
@@ -2020,11 +2109,10 @@ mod tests {
             Box::new(NoopProcessGuard),
             Box::new(FakeLogin(work_auth.clone())),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
         let refreshed_personal = auth("personal@example.com", 2);
-        fs::write(app.paths().live_auth_path(), &refreshed_personal).unwrap();
+        write_live_auth(&app, &refreshed_personal);
 
         app.add(false).unwrap();
 
@@ -2065,8 +2153,7 @@ mod tests {
             Box::new(NoopProcessGuard),
             Box::new(super::NoopLoginRunner),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
 
         assert!(matches!(app.add(false), Err(HandoffError::Preflight(_))));
@@ -2102,8 +2189,7 @@ mod tests {
             Box::new(NoopProcessGuard),
             Box::new(FakeLogin(work_auth.clone())),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
 
         let name = app.add(false).unwrap();
@@ -2132,8 +2218,7 @@ mod tests {
             Box::new(StaticProbe::success()),
             Box::new(NoopProcessGuard),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
         let app = App::with_all_components(
             app.paths().clone(),
@@ -2158,12 +2243,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_temporary, app) = app();
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(
-            app.paths().live_auth_path(),
-            auth("personal@example.com", 1),
-        )
-        .unwrap();
+        write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
@@ -2172,6 +2252,54 @@ mod tests {
         fs::set_permissions(
             app.paths().profile_auth_path(&work),
             fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.switch(work, false),
+            Err(super::HandoffError::InsecurePermissions(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_auth_with_insecure_permissions_is_rejected_and_reported_by_doctor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        fs::set_permissions(
+            app.paths().live_auth_path(),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.init(),
+            Err(super::HandoffError::InsecurePermissions(_))
+        ));
+        assert!(
+            app.doctor()
+                .iter()
+                .any(|item| item == "live auth: missing, invalid, or unreadable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switch_rejects_a_profile_directory_with_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        let work_metadata = app.new_metadata(work.clone(), &work_auth).unwrap();
+        app.save_profile(&work_metadata, &work_auth).unwrap();
+        fs::set_permissions(
+            app.paths().profile_dir(&work),
+            fs::Permissions::from_mode(0o755),
         )
         .unwrap();
 
@@ -2196,8 +2324,7 @@ mod tests {
             Box::new(NoopProcessGuard),
             Box::new(FakeLogin(replacement_auth.clone())),
         );
-        fs::create_dir_all(app.paths().codex_home()).unwrap();
-        fs::write(app.paths().live_auth_path(), &personal_auth).unwrap();
+        write_live_auth(&app, &personal_auth);
         app.init().unwrap();
         let created_at = app.status().unwrap().active.created_at;
 
@@ -2261,7 +2388,8 @@ done
 while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"id":2'*) printf '%s\n' '{"id":2,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"resetsAt":1700000000,"windowDurationMins":300},"secondary":null,"rateLimitReachedType":null,"spendControlReached":false},"other":{"primary":null,"secondary":{"usedPercent":80},"rateLimitReachedType":"rate_limit_reached","spendControlReached":true}},"rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"opaque-credit-id","title":"Reset","description":"One reset","status":"available"}]}}}'; exit 0 ;;
+    *'"id":2,"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+    *'"id":3,"method":"account/rateLimits/read"'*) printf '%s\n' '{"id":3,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"resetsAt":1700000000,"windowDurationMins":300},"secondary":null,"rateLimitReachedType":null,"spendControlReached":false},"other":{"primary":null,"secondary":{"usedPercent":80},"rateLimitReachedType":"rate_limit_reached","spendControlReached":true}},"rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"opaque-credit-id","title":"Reset","description":"One reset","status":"available"}]}}}'; exit 0 ;;
   esac
 done
 "#,
@@ -2285,5 +2413,36 @@ done
         assert_eq!(credits.available_count, 1);
         assert_eq!(credits.credits[0].title.as_deref(), Some("Reset"));
         assert_eq!(credits.credits[0].status, "available");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_usage_reader_keeps_remote_error_details_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("fake-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"id":2,"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+    *'"id":3,"method":"account/rateLimits/read"'*) printf '%s\n' '{"id":3,"error":{"code":-32001,"message":"super-secret-token"}}'; exit 0 ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = AppServerUsageReader::from_path(script)
+            .read(&auth("work@example.com", 1))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("JSON-RPC code -32001"));
+        assert!(!error.contains("super-secret-token"));
     }
 }

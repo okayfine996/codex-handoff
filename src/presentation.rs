@@ -4,7 +4,7 @@ use codex_handoff::{
     UsageStatus, UsageWindow,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
-use console::Style;
+use console::{Style, measure_text_width};
 use std::{io::IsTerminal, path::Path};
 
 const PROGRESS_WIDTH: usize = 10;
@@ -22,7 +22,8 @@ pub fn default_color_mode() -> ColorMode {
 }
 
 pub fn terminal_width() -> u16 {
-    console::Term::stdout().size().1.clamp(64, 110)
+    let width = console::Term::stdout().size().1;
+    if width == 0 { 110 } else { width.min(110) }
 }
 
 pub fn render_list(entries: &[ProfileListEntry]) -> String {
@@ -119,8 +120,12 @@ fn render_account(
     match usage {
         UsageStatus::Available(report) => {
             output.push_str("\n\n");
-            output.push_str(&usage_table(report, width, colors));
-            output.push_str(&usage_notes(report, colors));
+            if width < 64 {
+                output.push_str(&compact_usage(report, width, colors));
+            } else {
+                output.push_str(&usage_table(report, width, colors));
+            }
+            output.push_str(&usage_notes(report, width, colors));
         }
         UsageStatus::Unavailable(reason) => {
             output.push_str("\n\n");
@@ -168,6 +173,51 @@ fn usage_table(report: &UsageReport, width: u16, colors: bool) -> String {
     table.to_string()
 }
 
+fn compact_usage(report: &UsageReport, width: u16, colors: bool) -> String {
+    let mut lines = vec![paint("Quota", Accent::Title, colors)];
+    for bucket in &report.buckets {
+        for (slot, window) in [
+            ("primary", bucket.primary.as_ref()),
+            ("secondary", bucket.secondary.as_ref()),
+        ] {
+            let label = window_label(bucket, slot);
+            let Some(window) = window else {
+                lines.push(format!("  {label}  —"));
+                continue;
+            };
+            let bar_width = (width as usize)
+                .saturating_sub(measure_text_width(&label) + 14)
+                .clamp(3, PROGRESS_WIDTH);
+            lines.push(format!(
+                "  {label} {}",
+                progress_bar_with_width(window.used_percent, bar_width)
+            ));
+            let summary = format!(
+                "{}% used · {}% remaining",
+                window.used_percent,
+                100 - window.used_percent
+            );
+            lines.extend(wrap_with_indent(&summary, 4, width));
+            let reset = window
+                .resets_at
+                .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+                .map(|timestamp| timestamp.format("resets %b %-d %H:%M UTC").to_string());
+            let duration = window
+                .window_duration_mins
+                .map(|minutes| format!("window {}", format_duration(minutes)));
+            if reset.is_some() || duration.is_some() {
+                let detail = [reset, duration]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                lines.extend(wrap_with_indent(&detail, 4, width));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 fn add_window_row(
     table: &mut Table,
     bucket: &UsageBucket,
@@ -211,7 +261,7 @@ fn add_window_row(
     ]);
 }
 
-fn usage_notes(report: &UsageReport, colors: bool) -> String {
+fn usage_notes(report: &UsageReport, width: u16, colors: bool) -> String {
     let mut notes = Vec::new();
     for bucket in &report.buckets {
         if let Some(reached) = &bucket.reached_type {
@@ -226,7 +276,7 @@ fn usage_notes(report: &UsageReport, colors: bool) -> String {
         }
     }
     if let Some(credits) = &report.reset_credits {
-        notes.extend(render_reset_credits(credits, colors));
+        notes.extend(render_reset_credits(credits, width, colors));
     }
     if notes.is_empty() {
         String::new()
@@ -235,7 +285,7 @@ fn usage_notes(report: &UsageReport, colors: bool) -> String {
     }
 }
 
-fn render_reset_credits(credits: &ResetCredits, colors: bool) -> Vec<String> {
+fn render_reset_credits(credits: &ResetCredits, width: u16, colors: bool) -> Vec<String> {
     if credits.available_count == 0 {
         return Vec::new();
     }
@@ -251,7 +301,11 @@ fn render_reset_credits(credits: &ResetCredits, colors: bool) -> Vec<String> {
             .as_deref()
             .map(|description| format!(" — {description}"))
             .unwrap_or_default();
-        lines.push(format!("  {title} ({}){description}", credit.status));
+        lines.extend(wrap_with_indent(
+            &format!("{title} ({}){description}", credit.status),
+            2,
+            width,
+        ));
     }
     lines
 }
@@ -270,12 +324,61 @@ fn window_label(bucket: &UsageBucket, slot: &str) -> String {
 }
 
 fn progress_bar(used_percent: u8) -> String {
-    let filled = ((used_percent as usize * PROGRESS_WIDTH) + 50) / 100;
-    format!(
-        "[{}{}]",
-        "█".repeat(filled),
-        "░".repeat(PROGRESS_WIDTH - filled)
-    )
+    progress_bar_with_width(used_percent, PROGRESS_WIDTH)
+}
+
+fn progress_bar_with_width(used_percent: u8, width: usize) -> String {
+    let filled = ((used_percent as usize * width) + 50) / 100;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn wrap_with_indent(text: &str, indent: usize, width: u16) -> Vec<String> {
+    let available = (width as usize).saturating_sub(indent).max(1);
+    let prefix = " ".repeat(indent);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let separator = if current.is_empty() { "" } else { " " };
+        if measure_text_width(&current) + measure_text_width(separator) + measure_text_width(word)
+            <= available
+        {
+            current.push_str(separator);
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(format!("{prefix}{current}"));
+            current.clear();
+        }
+        for part in split_to_width(word, available) {
+            if measure_text_width(&part) == available {
+                lines.push(format!("{prefix}{part}"));
+            } else {
+                current = part;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(format!("{prefix}{current}"));
+    }
+    lines
+}
+
+fn split_to_width(word: &str, width: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for character in word.chars() {
+        if !current.is_empty()
+            && measure_text_width(&(current.clone() + &character.to_string())) > width
+        {
+            parts.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 fn format_duration(minutes: i64) -> String {
@@ -456,5 +559,57 @@ mod tests {
         assert!(output.contains("Usage not queried"));
         assert!(output.contains("Live auth  /tmp/codex/auth.json"));
         assert!(output.contains("Vault      /tmp/codex-handoff"));
+    }
+
+    #[test]
+    fn renders_quota_without_a_table_on_narrow_terminals() {
+        let profile = ProfileListEntry {
+            name: ProfileName::parse("personal").unwrap(),
+            metadata: Some(ProfileMetadata {
+                schema_version: 1,
+                name: ProfileName::parse("personal").unwrap(),
+                email: "personal@example.com".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 8, 29, 10, 0, 0).unwrap(),
+                last_synced_at: Utc.with_ymd_and_hms(2026, 8, 29, 11, 35, 0).unwrap(),
+            }),
+            active: true,
+            health: LocalHealth::Healthy,
+            usage: UsageStatus::Available(UsageReport {
+                buckets: vec![UsageBucket {
+                    id: "codex".into(),
+                    primary: Some(UsageWindow {
+                        used_percent: 18,
+                        resets_at: Some(1_788_021_409),
+                        window_duration_mins: Some(300),
+                    }),
+                    secondary: Some(UsageWindow {
+                        used_percent: 82,
+                        resets_at: Some(1_788_615_907),
+                        window_duration_mins: Some(10_080),
+                    }),
+                    reached_type: None,
+                    spend_control_reached: None,
+                }],
+                reset_credits: Some(ResetCredits {
+                    available_count: 1,
+                    credits: vec![ResetCredit {
+                        title: Some("Full reset".into()),
+                        description: Some(
+                            "Weekly and five-hour allowance reset is available".into(),
+                        ),
+                        status: "available".into(),
+                    }],
+                }),
+            }),
+        };
+
+        let output = render_profile(&profile, 40, ColorMode::Never);
+
+        assert!(output.contains("Quota"));
+        assert!(output.contains("5 hours"));
+        assert!(output.contains("Week"));
+        assert!(output.contains("Full reset"));
+        assert!(!output.contains('┌'));
+        assert!(output.lines().all(|line| measure_text_width(line) <= 40));
     }
 }
