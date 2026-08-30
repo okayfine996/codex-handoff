@@ -692,15 +692,6 @@ impl UsageReader for AppServerUsageReader {
                     &account,
                 ));
             }
-            if account
-                .pointer("/result/account/type")
-                .and_then(serde_json::Value::as_str)
-                != Some("chatgpt")
-            {
-                return Err(HandoffError::Usage(
-                    "Codex did not verify ChatGPT authentication".into(),
-                ));
-            }
             parse_auth(&fs::read(&auth_path)?)?;
             writeln!(
                 stdin,
@@ -2377,7 +2368,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    fn app_server_usage_reader_parses_all_limit_buckets_without_exposing_credit_ids() {
+    fn app_server_usage_reader_accepts_successful_account_reads_without_account_type() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().unwrap();
@@ -2388,7 +2379,7 @@ done
 while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"id":2,"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
+    *'"id":2,"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{}}' ;;
     *'"id":3,"method":"account/rateLimits/read"'*) printf '%s\n' '{"id":3,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"resetsAt":1700000000,"windowDurationMins":300},"secondary":null,"rateLimitReachedType":null,"spendControlReached":false},"other":{"primary":null,"secondary":{"usedPercent":80},"rateLimitReachedType":"rate_limit_reached","spendControlReached":true}},"rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"opaque-credit-id","title":"Reset","description":"One reset","status":"available"}]}}}'; exit 0 ;;
   esac
 done
