@@ -1,9 +1,13 @@
 use clap::{Parser, Subcommand};
 use codex_handoff::{
-    App, AppPaths, AppServerProbe, AppServerUsageReader, ProfileName, SystemLoginRunner,
-    SystemProcessGuard,
+    App, AppPaths, AppServerProbe, AppServerUsageReader, CodexExecHiRunner, ProfileName,
+    SystemCodexRunner, SystemLoginRunner, SystemProcessGuard,
 };
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    process::{ExitCode, ExitStatus},
+};
 
 mod presentation;
 
@@ -50,11 +54,20 @@ enum Command {
     List,
     Status,
     Doctor,
+    Hi {
+        #[arg(default_value = "hi")]
+        prompt: String,
+    },
+    Run {
+        name: String,
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("ch: {error}");
             ExitCode::from(1)
@@ -62,7 +75,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let default_paths = AppPaths::from_environment()?;
     let paths = AppPaths::new(
@@ -77,7 +90,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(SystemProcessGuard),
         Box::new(SystemLoginRunner::from_path(cli.codex_bin.clone())),
     )
-    .with_usage_reader(Box::new(AppServerUsageReader::from_path(cli.codex_bin)));
+    .with_usage_reader(Box::new(AppServerUsageReader::from_path(
+        cli.codex_bin.clone(),
+    )))
+    .with_hi_runner(Box::new(CodexExecHiRunner::from_path(
+        cli.codex_bin.clone(),
+    )))
+    .with_codex_runner(Box::new(SystemCodexRunner::from_path(cli.codex_bin)));
     match cli.command {
         Command::Init => {
             app.init()?;
@@ -131,6 +150,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{item}");
             }
         }
+        Command::Hi { prompt } => {
+            let results = app.hi(&prompt)?;
+            println!("{}", presentation::render_hi_results(&results, &prompt));
+        }
+        Command::Run { name, args } => {
+            return Ok(exit_code(
+                app.run_profile(&ProfileName::parse(name)?, &args)?,
+            ));
+        }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn exit_code(status: ExitStatus) -> ExitCode {
+    ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1),
+    )
 }

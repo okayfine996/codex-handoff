@@ -3,11 +3,12 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
+    ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -121,10 +122,16 @@ pub enum HandoffError {
     ClientShutdownTimeout(String),
     #[error("another ch operation is in progress")]
     Busy,
+    #[error("profile `{0}` is currently in use")]
+    ProfileBusy(String),
     #[error("authentication preflight failed: {0}")]
     Preflight(String),
     #[error("usage query failed: {0}")]
     Usage(String),
+    #[error("hi command failed: {0}")]
+    Hi(String),
+    #[error("could not start Codex: {0}")]
+    Run(String),
     #[error("insecure permissions on sensitive file: {0}")]
     InsecurePermissions(String),
     #[error("operation failed ({operation}) and rollback also failed: {rollback}")]
@@ -183,11 +190,26 @@ impl AppPaths {
     fn profile_metadata_path(&self, name: &ProfileName) -> PathBuf {
         self.profile_dir(name).join("profile.json")
     }
+    fn runtime_initialized_path(&self, name: &ProfileName) -> PathBuf {
+        self.profile_dir(name).join(".ch-runtime-initialized")
+    }
     fn state_path(&self) -> PathBuf {
         self.handoff_home.join("state.json")
     }
     fn lock_path(&self) -> PathBuf {
         self.handoff_home.join("lock")
+    }
+    fn sessions_dir(&self) -> PathBuf {
+        self.handoff_home.join("sessions")
+    }
+    fn runtime_locks_dir(&self) -> PathBuf {
+        self.handoff_home.join("runtime-locks")
+    }
+    fn runtime_lock_path(&self, name: &ProfileName) -> PathBuf {
+        self.runtime_locks_dir().join(format!("{}.lock", name.as_str()))
+    }
+    fn session_path(&self, pid: u32) -> PathBuf {
+        self.sessions_dir().join(format!("{pid}.json"))
     }
 }
 
@@ -204,6 +226,21 @@ pub struct ProfileMetadata {
 struct State {
     schema_version: u8,
     active_profile: ProfileName,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunSession {
+    profile: ProfileName,
+    pid: u32,
+    #[serde(default)]
+    uses_live_home: bool,
+    #[serde(default)]
+    started_at: Option<String>,
+}
+
+struct SwitchClientScope {
+    default_clients: Vec<ClientProcess>,
+    target_sessions: Vec<ClientProcess>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,18 +314,26 @@ pub struct ProfileListEntry {
     pub usage: UsageStatus,
 }
 
+#[derive(Clone, Debug)]
+pub struct HiProfileResult {
+    pub name: ProfileName,
+    pub email: String,
+    pub active: bool,
+    pub reply: Result<String, String>,
+}
+
 pub trait AuthProbe: Send + Sync {
     fn probe(&self, auth: &[u8]) -> Result<Vec<u8>, HandoffError>;
 }
 
 pub trait UsageReader: Send + Sync {
-    fn read(&self, auth: &[u8]) -> Result<UsageReport, HandoffError>;
+    fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError>;
 }
 
 pub struct UnavailableUsageReader;
 
 impl UsageReader for UnavailableUsageReader {
-    fn read(&self, _auth: &[u8]) -> Result<UsageReport, HandoffError> {
+    fn read(&self, _auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
         Err(HandoffError::Preflight(
             "usage reader is unavailable".into(),
         ))
@@ -331,6 +376,21 @@ impl AuthProbe for StaticProbe {
 pub trait ProcessGuard: Send + Sync {
     fn ensure_stopped(&self, force: bool) -> Result<(), HandoffError>;
 
+    fn running_clients(&self) -> Result<Vec<ClientProcess>, HandoffError> {
+        self.ensure_stopped(false)?;
+        Ok(Vec::new())
+    }
+
+    fn close_clients(&self, clients: &[ClientProcess]) -> Result<(), HandoffError> {
+        if clients.is_empty() {
+            Ok(())
+        } else {
+            Err(HandoffError::ClientShutdownFailed(
+                ClientProcess::display_list(clients),
+            ))
+        }
+    }
+
     fn close_gracefully(&self) -> Result<(), HandoffError> {
         self.ensure_stopped(false)
     }
@@ -347,9 +407,9 @@ impl ProcessGuard for NoopProcessGuard {
 pub struct SystemProcessGuard;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ClientProcess {
-    name: &'static str,
-    pid: u32,
+pub struct ClientProcess {
+    pub name: &'static str,
+    pub pid: u32,
 }
 
 impl ClientProcess {
@@ -369,6 +429,14 @@ impl ProcessGuard for SystemProcessGuard {
 
     fn close_gracefully(&self) -> Result<(), HandoffError> {
         let clients = self.running_clients()?;
+        self.close_clients(&clients)
+    }
+
+    fn running_clients(&self) -> Result<Vec<ClientProcess>, HandoffError> {
+        SystemProcessGuard::running_clients(self)
+    }
+
+    fn close_clients(&self, clients: &[ClientProcess]) -> Result<(), HandoffError> {
         for application in ["Codex", "ChatGPT"] {
             if clients.iter().any(|client| client.name == application) {
                 let status = Command::new("osascript")
@@ -391,20 +459,25 @@ impl ProcessGuard for SystemProcessGuard {
             }
         }
         for _ in 0..50 {
-            let remaining = self.running_clients()?;
-            if remaining.is_empty() {
+            if clients.iter().all(|client| !process_exists(client.pid)) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let remaining = self.running_clients()?;
+        let remaining = clients
+            .iter()
+            .filter(|client| process_exists(client.pid))
+            .cloned()
+            .collect::<Vec<_>>();
         if remaining.is_empty() {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(HandoffError::ClientShutdownTimeout(
+                ClientProcess::display_list(&remaining),
+            ))
         }
-        Err(HandoffError::ClientShutdownTimeout(
-            ClientProcess::display_list(&remaining),
-        ))
     }
+
 }
 
 impl SystemProcessGuard {
@@ -441,6 +514,29 @@ fn ensure_clients_stopped(
     } else {
         Err(HandoffError::ClientRunning)
     }
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn process_start_time(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 pub struct AppServerProbe {
@@ -591,7 +687,7 @@ impl AppServerUsageReader {
 }
 
 impl UsageReader for AppServerUsageReader {
-    fn read(&self, auth: &[u8]) -> Result<UsageReport, HandoffError> {
+    fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
         parse_auth(auth)?;
         let temporary = tempfile::tempdir()?;
         let auth_path = temporary.path().join("auth.json");
@@ -705,11 +801,14 @@ impl UsageReader for AppServerUsageReader {
                     &response,
                 ));
             }
-            parse_usage_report(
+            let report = parse_usage_report(
                 response
                     .get("result")
                     .ok_or_else(|| HandoffError::Usage("Codex returned no usage result".into()))?,
-            )
+            )?;
+            let updated_auth = fs::read(&auth_path)?;
+            parse_auth(&updated_auth)?;
+            Ok((report, updated_auth))
         })();
         let _ = child.kill();
         let _ = child.wait();
@@ -895,12 +994,147 @@ impl LoginRunner for NoopLoginRunner {
     }
 }
 
+pub trait HiRunner: Send + Sync {
+    fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError>;
+}
+
+pub struct UnavailableHiRunner;
+
+impl HiRunner for UnavailableHiRunner {
+    fn send_hi(&self, _auth: &[u8], _prompt: &str) -> Result<(String, Vec<u8>), HandoffError> {
+        Err(HandoffError::Hi("hi runner is unavailable".into()))
+    }
+}
+
+pub struct CodexExecHiRunner {
+    codex_binary: PathBuf,
+}
+
+impl CodexExecHiRunner {
+    pub fn from_path(codex_binary: impl Into<PathBuf>) -> Self {
+        Self {
+            codex_binary: codex_binary.into(),
+        }
+    }
+}
+
+impl HiRunner for CodexExecHiRunner {
+    fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError> {
+        parse_auth(auth)?;
+        let temporary = tempfile::tempdir()?;
+        let auth_path = temporary.path().join("auth.json");
+        fs::write(&auth_path, auth)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        let output = Command::new(&self.codex_binary)
+            .args([
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "--sandbox",
+                "read-only",
+                prompt,
+            ])
+            .env("CODEX_HOME", temporary.path())
+            .current_dir(temporary.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| {
+                HandoffError::Hi(format!("could not start Codex exec: {error}"))
+            })?;
+
+        let updated_auth = fs::read(&auth_path).unwrap_or_else(|_| auth.to_vec());
+        let updated_auth = if parse_auth(&updated_auth).is_ok() {
+            updated_auth
+        } else {
+            auth.to_vec()
+        };
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let msg = if stdout.is_empty() {
+                "(empty response)".to_string()
+            } else {
+                stdout
+            };
+            Ok((msg, updated_auth))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let details = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit code {:?}", output.status.code())
+            };
+            Err(HandoffError::Hi(details))
+        }
+    }
+}
+
+pub trait CodexRunner: Send + Sync {
+    fn spawn(
+        &self,
+        codex_home: &Path,
+        args: &[OsString],
+    ) -> Result<std::process::Child, HandoffError>;
+}
+
+pub struct SystemCodexRunner {
+    codex_binary: PathBuf,
+}
+
+impl SystemCodexRunner {
+    pub fn from_path(codex_binary: impl Into<PathBuf>) -> Self {
+        Self {
+            codex_binary: codex_binary.into(),
+        }
+    }
+}
+
+impl CodexRunner for SystemCodexRunner {
+    fn spawn(
+        &self,
+        codex_home: &Path,
+        args: &[OsString],
+    ) -> Result<std::process::Child, HandoffError> {
+        Command::new(&self.codex_binary)
+            .args(args)
+            .env("CODEX_HOME", codex_home)
+            .spawn()
+            .map_err(|error| HandoffError::Run(error.to_string()))
+    }
+}
+
+pub struct UnavailableCodexRunner;
+
+impl CodexRunner for UnavailableCodexRunner {
+    fn spawn(
+        &self,
+        _codex_home: &Path,
+        _args: &[OsString],
+    ) -> Result<std::process::Child, HandoffError> {
+        Err(HandoffError::Run("Codex runner is unavailable".into()))
+    }
+}
+
 pub struct App {
     paths: AppPaths,
     probe: Box<dyn AuthProbe>,
     process_guard: Box<dyn ProcessGuard>,
     login_runner: Box<dyn LoginRunner>,
     usage_reader: Box<dyn UsageReader>,
+    hi_runner: Box<dyn HiRunner>,
+    codex_runner: Box<dyn CodexRunner>,
 }
 
 #[derive(Default)]
@@ -957,6 +1191,8 @@ impl App {
             process_guard,
             login_runner: Box::new(NoopLoginRunner),
             usage_reader: Box::new(UnavailableUsageReader),
+            hi_runner: Box::new(UnavailableHiRunner),
+            codex_runner: Box::new(UnavailableCodexRunner),
         }
     }
 
@@ -972,11 +1208,23 @@ impl App {
             process_guard,
             login_runner,
             usage_reader: Box::new(UnavailableUsageReader),
+            hi_runner: Box::new(UnavailableHiRunner),
+            codex_runner: Box::new(UnavailableCodexRunner),
         }
     }
 
     pub fn with_usage_reader(mut self, usage_reader: Box<dyn UsageReader>) -> Self {
         self.usage_reader = usage_reader;
+        self
+    }
+
+    pub fn with_hi_runner(mut self, hi_runner: Box<dyn HiRunner>) -> Self {
+        self.hi_runner = hi_runner;
+        self
+    }
+
+    pub fn with_codex_runner(mut self, codex_runner: Box<dyn CodexRunner>) -> Self {
+        self.codex_runner = codex_runner;
         self
     }
 
@@ -1030,17 +1278,72 @@ impl App {
         })
     }
 
+    pub fn run_profile(
+        &self,
+        name: &ProfileName,
+        args: &[OsString],
+    ) -> Result<ExitStatus, HandoffError> {
+        let (mut child, runtime_lease) = {
+            let _lock = self.lock()?;
+            let state = self.load_state()?;
+            let profile = self.load_profile(name)?;
+            let is_active = state.active_profile == *name;
+            let auth = if is_active {
+                self.read_live_auth()?
+            } else {
+                self.read_profile_auth(name)?
+            };
+            self.ensure_profile_email(&profile, &auth)?;
+            let (codex_home, runtime_lease) = if is_active {
+                (self.paths.codex_home().to_path_buf(), None)
+            } else {
+                self.bootstrap_profile_runtime(name)?;
+                (
+                    self.paths.profile_dir(name),
+                    Some(self.acquire_runtime_lock_shared(name)?),
+                )
+            };
+            let mut child = self
+                .codex_runner
+                .spawn(&codex_home, args)?;
+            if let Err(error) = self.register_session(name, child.id(), is_active) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            (child, runtime_lease)
+        };
+        let status = child.wait();
+        drop(runtime_lease);
+        let _ = self.remove_session(child.id());
+        Ok(status?)
+    }
+
     pub fn current_live_usage(&self) -> Result<UsageStatus, HandoffError> {
         let status = self.status()?;
-        let usage = self
-            .read_live_auth()
-            .and_then(|auth| {
-                self.ensure_profile_email(&status.active, &auth)?;
-                self.usage_reader.read(&auth)
-            })
-            .map(UsageStatus::Available)
-            .unwrap_or_else(|error| UsageStatus::Unavailable(error.to_string()));
-        Ok(usage)
+        if self.default_clients_are_running(&status.active.name)? {
+            return Ok(UsageStatus::Unavailable(
+                "active Codex or ChatGPT client is running; usage was not refreshed".into(),
+            ));
+        }
+        let auth = self.read_live_auth()?;
+        self.ensure_profile_email(&status.active, &auth)?;
+        match self.usage_reader.read(&auth) {
+            Ok((usage_report, updated_auth)) => {
+                if updated_auth != auth {
+                    let _ = self.write_auth(&self.paths.live_auth_path(), &updated_auth);
+                    let _ = self.write_auth(
+                        &self.paths.profile_auth_path(&status.active.name),
+                        &updated_auth,
+                    );
+                    let mut meta = status.active.clone();
+                    meta.last_synced_at = Utc::now();
+                    let _ = self.save_metadata(&meta);
+                }
+                Ok(UsageStatus::Available(usage_report))
+            }
+            Err(error) => Ok(UsageStatus::Unavailable(error.to_string())),
+        }
     }
 
     pub fn list(&self) -> Result<Vec<ProfileListEntry>, HandoffError> {
@@ -1079,21 +1382,7 @@ impl App {
             let usage = if include_usage {
                 match (&metadata, &health) {
                     (Some(metadata), LocalHealth::Healthy) => {
-                        let auth = if is_active {
-                            self.read_live_auth()
-                        } else {
-                            self.read_profile_auth(&name)
-                        };
-                        match auth
-                            .and_then(|auth| {
-                                self.ensure_profile_email(metadata, &auth)?;
-                                self.usage_reader.read(&auth)
-                            })
-                            .map(UsageStatus::Available)
-                        {
-                            Ok(usage) => usage,
-                            Err(error) => UsageStatus::Unavailable(error.to_string()),
-                        }
+                        self.profile_usage(&name, metadata, is_active)
                     }
                     _ => UsageStatus::Unavailable("local profile is unhealthy".into()),
                 }
@@ -1110,6 +1399,132 @@ impl App {
         }
         profiles.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
         Ok(profiles)
+    }
+
+    pub fn hi(&self, prompt: &str) -> Result<Vec<HiProfileResult>, HandoffError> {
+        let active = self.load_state().ok().map(|state| state.active_profile);
+        let mut results = Vec::new();
+        if !self.paths.profiles_dir().exists() {
+            return Ok(results);
+        }
+        for entry in fs::read_dir(self.paths.profiles_dir())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| ProfileName::parse(name).ok())
+            else {
+                continue;
+            };
+            let is_active = active.as_ref() == Some(&name);
+            let (metadata, health) = match self.load_profile(&name) {
+                Ok(metadata) => match self.read_profile_auth(&name) {
+                    Ok(auth) => match self.ensure_profile_email(&metadata, &auth) {
+                        Ok(()) => (Some(metadata), LocalHealth::Healthy),
+                        Err(error) => (Some(metadata), LocalHealth::Unhealthy(error.to_string())),
+                    },
+                    Err(error) => (Some(metadata), LocalHealth::Unhealthy(error.to_string())),
+                },
+                Err(error) => (None, LocalHealth::Unhealthy(error.to_string())),
+            };
+
+            let email = metadata
+                .as_ref()
+                .map(|meta| meta.email.clone())
+                .unwrap_or_else(|| "<unknown>".to_string());
+
+            let reply = match (&metadata, &health) {
+                (Some(metadata), LocalHealth::Healthy) => {
+                    if is_active && self.default_clients_are_running(&name)? {
+                        results.push(HiProfileResult {
+                            name,
+                            email,
+                            active: is_active,
+                            reply: Err(
+                                "active Codex or ChatGPT client is running; prompt was not sent"
+                                    .into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let runtime_lock = if is_active {
+                        None
+                    } else {
+                        match self.acquire_runtime_lock_exclusive(&name) {
+                            Ok(lock) => Some(lock),
+                            Err(HandoffError::ProfileBusy(_)) => {
+                                results.push(HiProfileResult {
+                                    name,
+                                    email,
+                                    active: is_active,
+                                    reply: Err(
+                                        "profile is currently in use; prompt was not sent".into(),
+                                    ),
+                                });
+                                continue;
+                            }
+                            Err(error) => {
+                                results.push(HiProfileResult {
+                                    name,
+                                    email,
+                                    active: is_active,
+                                    reply: Err(error.to_string()),
+                                });
+                                continue;
+                            }
+                        }
+                    };
+                    let auth = if is_active {
+                        self.read_live_auth()
+                    } else {
+                        self.read_profile_auth(&name)
+                    };
+                    let reply = match auth {
+                        Ok(auth) => match self.ensure_profile_email(metadata, &auth) {
+                            Ok(()) => match self.hi_runner.send_hi(&auth, prompt) {
+                                Ok((msg, updated_auth)) => {
+                                    if updated_auth != auth {
+                                        let _ = self.write_auth(
+                                            &self.paths.profile_auth_path(&name),
+                                            &updated_auth,
+                                        );
+                                        let mut meta = metadata.clone();
+                                        meta.last_synced_at = Utc::now();
+                                        let _ = self.save_metadata(&meta);
+                                        if is_active {
+                                            let _ = self.write_auth(
+                                                &self.paths.live_auth_path(),
+                                                &updated_auth,
+                                            );
+                                        }
+                                    }
+                                    Ok(msg)
+                                }
+                                Err(error) => Err(error.to_string()),
+                            },
+                            Err(error) => Err(error.to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    };
+                    drop(runtime_lock);
+                    reply
+                }
+                (_, LocalHealth::Unhealthy(reason)) => Err(format!("unhealthy profile: {reason}")),
+                _ => Err("profile is unavailable".into()),
+            };
+
+            results.push(HiProfileResult {
+                name,
+                email,
+                active: is_active,
+                reply,
+            });
+        }
+        results.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+        Ok(results)
     }
 
     pub fn sync(&self, force: bool) -> Result<(), HandoffError> {
@@ -1146,12 +1561,21 @@ impl App {
             return Err(HandoffError::ConflictingProcessOptions);
         }
         let _lock = self.lock()?;
-        if close_clients {
-            self.process_guard.close_gracefully()?;
-        } else {
-            self.process_guard.ensure_stopped(force)?;
-        }
         let state = self.load_state()?;
+        let mut client_scope = self.switch_client_scope(&name)?;
+        if close_clients && !client_scope.default_clients.is_empty() {
+            self.process_guard.close_clients(&client_scope.default_clients)?;
+            client_scope = self.switch_client_scope(&name)?;
+        }
+        if !client_scope.default_clients.is_empty() {
+            return Err(HandoffError::ClientRunning);
+        }
+        if !client_scope.target_sessions.is_empty() {
+            return Err(HandoffError::ProfileBusy(name.as_str().into()));
+        }
+        let _target_runtime_lock = (state.active_profile != name)
+            .then(|| self.acquire_runtime_lock_exclusive(&name))
+            .transpose()?;
         let target = self.load_profile(&name)?;
         let target_auth = self.read_profile_auth(&name)?;
         self.ensure_profile_email(&target, &target_auth)?;
@@ -1360,7 +1784,9 @@ impl App {
 
     fn ensure_layout(&self) -> Result<(), HandoffError> {
         private_dir(self.paths.handoff_home())?;
-        private_dir(&self.paths.profiles_dir())
+        private_dir(&self.paths.profiles_dir())?;
+        private_dir(&self.paths.sessions_dir())?;
+        private_dir(&self.paths.runtime_locks_dir())
     }
 
     fn remove_empty_profile_dir(&self, name: &ProfileName) -> Result<(), HandoffError> {
@@ -1484,6 +1910,195 @@ impl App {
             return Err(HandoffError::ProfileMissing(name.as_str().into()));
         }
         ensure_private_dir_path(&path)
+    }
+
+    fn bootstrap_profile_runtime(&self, name: &ProfileName) -> Result<(), HandoffError> {
+        let marker = self.paths.runtime_initialized_path(name);
+        if marker.exists() {
+            ensure_private_file_path(&marker)?;
+            return Ok(());
+        }
+
+        let source = self.paths.codex_home();
+        if source.is_dir() {
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    continue;
+                };
+                if file_name != "config.toml" && !file_name.ends_with(".config.toml") {
+                    continue;
+                }
+                let destination = self.paths.profile_dir(name).join(file_name);
+                if !destination.exists() {
+                    self.atomic_write(&destination, &fs::read(entry.path())?)?;
+                }
+            }
+        }
+        self.atomic_write(&marker, b"initialized\n")
+    }
+
+    fn acquire_runtime_lock_shared(&self, name: &ProfileName) -> Result<File, HandoffError> {
+        let file = self.open_runtime_lock(name)?;
+        file.try_lock_shared()
+            .map_err(|_| HandoffError::ProfileBusy(name.as_str().into()))?;
+        Ok(file)
+    }
+
+    fn acquire_runtime_lock_exclusive(&self, name: &ProfileName) -> Result<File, HandoffError> {
+        let file = self.open_runtime_lock(name)?;
+        file.try_lock_exclusive()
+            .map_err(|_| HandoffError::ProfileBusy(name.as_str().into()))?;
+        Ok(file)
+    }
+
+    fn open_runtime_lock(&self, name: &ProfileName) -> Result<File, HandoffError> {
+        private_dir(&self.paths.runtime_locks_dir())?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.paths.runtime_lock_path(name))?;
+        private_file(&file)?;
+        Ok(file)
+    }
+
+    fn register_session(
+        &self,
+        profile: &ProfileName,
+        pid: u32,
+        uses_live_home: bool,
+    ) -> Result<(), HandoffError> {
+        self.atomic_write(
+            &self.paths.session_path(pid),
+            &serde_json::to_vec(&RunSession {
+                profile: profile.clone(),
+                pid,
+                uses_live_home,
+                started_at: process_start_time(pid),
+            })?,
+        )
+    }
+
+    fn remove_session(&self, pid: u32) -> Result<(), HandoffError> {
+        let _lock = self.lock()?;
+        let path = self.paths.session_path(pid);
+        if path.exists() {
+            ensure_private_file_path(&path)?;
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn managed_sessions(&self) -> Result<Vec<RunSession>, HandoffError> {
+        let directory = self.paths.sessions_dir();
+        let mut sessions = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            ensure_private_file_path(&entry.path())?;
+            let session: RunSession = serde_json::from_slice(&fs::read(entry.path())?)?;
+            if process_exists(session.pid)
+                && session.started_at.as_deref() == process_start_time(session.pid).as_deref()
+            {
+                sessions.push(session);
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(sessions)
+    }
+
+    fn switch_client_scope(&self, target: &ProfileName) -> Result<SwitchClientScope, HandoffError> {
+        let sessions = self.managed_sessions()?;
+        let mut default_clients = Vec::new();
+        let mut target_sessions = Vec::new();
+        for client in self.process_guard.running_clients()? {
+            match sessions.iter().find(|session| session.pid == client.pid) {
+                Some(session) if session.profile == *target && !session.uses_live_home => {
+                    target_sessions.push(client)
+                }
+                Some(session) if !session.uses_live_home => {}
+                _ => default_clients.push(client),
+            }
+        }
+        Ok(SwitchClientScope {
+            default_clients,
+            target_sessions,
+        })
+    }
+
+    fn default_clients_are_running(&self, active: &ProfileName) -> Result<bool, HandoffError> {
+        Ok(!self.switch_client_scope(active)?.default_clients.is_empty())
+    }
+
+    fn profile_usage(
+        &self,
+        name: &ProfileName,
+        metadata: &ProfileMetadata,
+        is_active: bool,
+    ) -> UsageStatus {
+        if is_active {
+            match self.default_clients_are_running(name) {
+                Ok(true) => {
+                    return UsageStatus::Unavailable(
+                        "active Codex or ChatGPT client is running; usage was not refreshed"
+                            .into(),
+                    );
+                }
+                Err(error) => return UsageStatus::Unavailable(error.to_string()),
+                Ok(false) => {}
+            }
+        }
+
+        let runtime_lock = if is_active {
+            None
+        } else {
+            match self.acquire_runtime_lock_exclusive(name) {
+                Ok(lock) => Some(lock),
+                Err(HandoffError::ProfileBusy(_)) => {
+                    return UsageStatus::Unavailable(
+                        "profile is currently in use; usage was not refreshed".into(),
+                    );
+                }
+                Err(error) => return UsageStatus::Unavailable(error.to_string()),
+            }
+        };
+        let auth = if is_active {
+            self.read_live_auth()
+        } else {
+            self.read_profile_auth(name)
+        };
+        let result = auth.and_then(|auth| {
+            self.ensure_profile_email(metadata, &auth)?;
+            self.usage_reader
+                .read(&auth)
+                .map(|(report, updated_auth)| (report, auth, updated_auth))
+        });
+        let usage = match result {
+            Ok((report, original_auth, updated_auth)) => {
+                if updated_auth != original_auth {
+                    let _ = self.write_auth(&self.paths.profile_auth_path(name), &updated_auth);
+                    if is_active {
+                        let _ = self.write_auth(&self.paths.live_auth_path(), &updated_auth);
+                    }
+                    let mut refreshed_metadata = metadata.clone();
+                    refreshed_metadata.last_synced_at = Utc::now();
+                    let _ = self.save_metadata(&refreshed_metadata);
+                }
+                UsageStatus::Available(report)
+            }
+            Err(error) => UsageStatus::Unavailable(error.to_string()),
+        };
+        drop(runtime_lock);
+        usage
     }
 
     fn save_metadata(&self, profile: &ProfileMetadata) -> Result<(), HandoffError> {
@@ -1665,9 +2280,11 @@ fn parse_auth(bytes: &[u8]) -> Result<AuthInfo, HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, HandoffError, LoginRunner,
-        NoopProcessGuard, ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader,
-        UsageReport, UsageStatus, UsageWindow, ensure_clients_stopped,
+        App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, CodexExecHiRunner,
+        ClientProcess, CodexRunner, HandoffError, HiRunner, LoginRunner, NoopProcessGuard,
+        ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader, UsageReport,
+        UsageStatus, UsageWindow,
+        ensure_clients_stopped,
     };
     use std::{
         fs,
@@ -1679,6 +2296,33 @@ mod tests {
     };
 
     struct FakeLogin(Vec<u8>);
+
+    #[derive(Clone)]
+    struct RecordingCodexRunner {
+        calls: Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Vec<std::ffi::OsString>)>>>,
+    }
+
+    impl RecordingCodexRunner {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl CodexRunner for RecordingCodexRunner {
+        fn spawn(
+            &self,
+            codex_home: &Path,
+            args: &[std::ffi::OsString],
+        ) -> Result<std::process::Child, HandoffError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((codex_home.to_path_buf(), args.to_vec()));
+            Ok(std::process::Command::new("true").spawn()?)
+        }
+    }
 
     struct RejectingProcessGuard;
 
@@ -1710,7 +2354,19 @@ mod tests {
             }
         }
 
-        fn close_gracefully(&self) -> Result<(), HandoffError> {
+        fn running_clients(&self) -> Result<Vec<ClientProcess>, HandoffError> {
+            if self.closed.load(Ordering::SeqCst) {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![ClientProcess {
+                    name: "codex",
+                    pid: 424_242,
+                }])
+            }
+        }
+
+        fn close_clients(&self, clients: &[ClientProcess]) -> Result<(), HandoffError> {
+            assert_eq!(clients.len(), 1);
             self.closed.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1729,38 +2385,97 @@ mod tests {
         }
     }
 
-    struct FakeUsageReader;
+    struct FakeUsageReader {
+        refreshed_auth: Option<Vec<u8>>,
+    }
+
+    impl FakeUsageReader {
+        fn new() -> Self {
+            Self {
+                refreshed_auth: None,
+            }
+        }
+
+        fn with_refreshed_auth(auth: Vec<u8>) -> Self {
+            Self {
+                refreshed_auth: Some(auth),
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct CountingUsageReader(Arc<AtomicBool>);
 
     impl UsageReader for FakeUsageReader {
-        fn read(&self, auth: &[u8]) -> Result<UsageReport, HandoffError> {
+        fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
             let email = super::parse_auth(auth)?.email;
-            if email == "work@example.com" {
+            if self.refreshed_auth.is_none() && email == "work@example.com" {
                 return Err(HandoffError::Preflight("quota service unavailable".into()));
             }
-            Ok(UsageReport {
-                buckets: vec![UsageBucket {
-                    id: "codex".into(),
-                    primary: Some(UsageWindow {
-                        used_percent: 25,
-                        resets_at: Some(1_700_000_000),
-                        window_duration_mins: Some(300),
-                    }),
-                    secondary: None,
-                    reached_type: None,
-                    spend_control_reached: None,
-                }],
-                reset_credits: None,
-            })
+            let updated = self.refreshed_auth.clone().unwrap_or_else(|| auth.to_vec());
+            Ok((
+                UsageReport {
+                    buckets: vec![UsageBucket {
+                        id: "codex".into(),
+                        primary: Some(UsageWindow {
+                            used_percent: 25,
+                            resets_at: Some(1_700_000_000),
+                            window_duration_mins: Some(300),
+                        }),
+                        secondary: None,
+                        reached_type: None,
+                        spend_control_reached: None,
+                    }],
+                    reset_credits: None,
+                },
+                updated,
+            ))
         }
     }
 
     impl UsageReader for CountingUsageReader {
-        fn read(&self, _auth: &[u8]) -> Result<UsageReport, HandoffError> {
+        fn read(&self, _auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
             self.0.store(true, Ordering::SeqCst);
             Err(HandoffError::Usage("usage lookup should not run".into()))
+        }
+    }
+
+    struct FakeHiRunner {
+        fail_email: Option<String>,
+        refreshed_auth: Option<Vec<u8>>,
+    }
+
+    impl FakeHiRunner {
+        fn success() -> Self {
+            Self {
+                fail_email: None,
+                refreshed_auth: None,
+            }
+        }
+
+        fn with_failing_email(email: impl Into<String>) -> Self {
+            Self {
+                fail_email: Some(email.into()),
+                refreshed_auth: None,
+            }
+        }
+
+        fn with_refreshed_auth(auth: Vec<u8>) -> Self {
+            Self {
+                fail_email: None,
+                refreshed_auth: Some(auth),
+            }
+        }
+    }
+
+    impl HiRunner for FakeHiRunner {
+        fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError> {
+            let email = super::parse_auth(auth)?.email;
+            if self.fail_email.as_deref() == Some(&email) {
+                return Err(HandoffError::Hi("failed to execute prompt".into()));
+            }
+            let updated = self.refreshed_auth.clone().unwrap_or_else(|| auth.to_vec());
+            Ok((format!("reply to {prompt} for {email}"), updated))
         }
     }
 
@@ -1811,6 +2526,118 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn run_uses_a_non_active_profile_as_a_persistent_codex_home_and_bootstraps_config_once() {
+        let (_temporary, app) = app();
+        let runner = RecordingCodexRunner::new();
+        let calls = runner.calls.clone();
+        let app = app.with_codex_runner(Box::new(runner));
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let profile = ProfileName::parse("work").unwrap();
+        let profile_auth = auth("work@example.com", 1);
+        let profile_metadata = app.new_metadata(profile.clone(), &profile_auth).unwrap();
+        app.save_profile(&profile_metadata, &profile_auth).unwrap();
+        fs::create_dir_all(app.paths().codex_home()).unwrap();
+        fs::write(
+            app.paths().codex_home().join("config.toml"),
+            "model = \"gpt-5\"\n",
+        )
+        .unwrap();
+        fs::write(
+            app.paths().codex_home().join("review.config.toml"),
+            "model = \"gpt-5-mini\"\n",
+        )
+        .unwrap();
+
+        app.run_profile(&profile, &["--no-alt-screen".into()])
+            .unwrap();
+        fs::write(
+            app.paths().codex_home().join("config.toml"),
+            "model = \"replacement\"\n",
+        )
+        .unwrap();
+        app.run_profile(&profile, &[]).unwrap();
+
+        let profile_dir = app.paths().profile_dir(&profile);
+        assert_eq!(
+            fs::read_to_string(profile_dir.join("config.toml")).unwrap(),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(profile_dir.join("review.config.toml")).unwrap(),
+            "model = \"gpt-5-mini\"\n"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (profile_dir.clone(), vec!["--no-alt-screen".into()]),
+                (profile_dir, vec![]),
+            ]
+        );
+        assert!(
+            fs::read_dir(app.paths().sessions_dir())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_uses_the_global_home_for_the_active_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let runner = RecordingCodexRunner::new();
+        let calls = runner.calls.clone();
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_codex_runner(Box::new(runner));
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+
+        app.run_profile(&ProfileName::parse("personal").unwrap(), &[])
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(app.paths().codex_home().to_path_buf(), vec![])]
+        );
+        assert!(
+            !app.paths()
+                .runtime_initialized_path(&ProfileName::parse("personal").unwrap())
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_codex_runner_passes_the_profile_home_to_the_child_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("profile");
+        let script = temporary.path().join("fake-codex");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$CODEX_HOME\" = \"{}\" ] || exit 7\nexit 42\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runner = super::SystemCodexRunner::from_path(script);
+        let status = runner.spawn(&home, &[]).unwrap().wait().unwrap();
+
+        assert_eq!(status.code(), Some(42));
     }
 
     #[test]
@@ -1977,6 +2804,42 @@ mod tests {
     }
 
     #[test]
+    fn switch_only_blocks_the_target_profile_runtime() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        );
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        app.save_profile(&app.new_metadata(work.clone(), &work_auth).unwrap(), &work_auth)
+            .unwrap();
+        let other = ProfileName::parse("other").unwrap();
+        let other_auth = auth("other@example.com", 1);
+        app.save_profile(&app.new_metadata(other.clone(), &other_auth).unwrap(), &other_auth)
+            .unwrap();
+
+        let target_lease = app.acquire_runtime_lock_shared(&work).unwrap();
+        assert!(matches!(
+            app.switch(work.clone(), false),
+            Err(HandoffError::ProfileBusy(name)) if name == "work"
+        ));
+        drop(target_lease);
+
+        let unrelated_lease = app.acquire_runtime_lock_shared(&other).unwrap();
+        app.switch(work.clone(), false).unwrap();
+        drop(unrelated_lease);
+        assert_eq!(app.status().unwrap().active.name, work);
+    }
+
+    #[test]
     fn list_includes_usage_for_each_profile_without_failing_all_profiles() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(
@@ -1988,7 +2851,7 @@ mod tests {
             Box::new(StaticProbe::success()),
             Box::new(NoopProcessGuard),
         )
-        .with_usage_reader(Box::new(FakeUsageReader));
+        .with_usage_reader(Box::new(FakeUsageReader::new()));
         write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
@@ -2022,7 +2885,7 @@ mod tests {
             Box::new(StaticProbe::success()),
             Box::new(NoopProcessGuard),
         )
-        .with_usage_reader(Box::new(FakeUsageReader));
+        .with_usage_reader(Box::new(FakeUsageReader::new()));
         write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
 
@@ -2388,10 +3251,11 @@ done
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let report = AppServerUsageReader::from_path(script)
+        let (report, updated_auth) = AppServerUsageReader::from_path(script)
             .read(&auth("work@example.com", 1))
             .unwrap();
 
+        assert_eq!(updated_auth, auth("work@example.com", 1));
         assert_eq!(report.buckets.len(), 2);
         assert_eq!(report.buckets[0].id, "codex");
         assert_eq!(report.buckets[0].primary.as_ref().unwrap().used_percent, 25);
@@ -2435,5 +3299,311 @@ done
 
         assert!(error.contains("JSON-RPC code -32001"));
         assert!(!error.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn hi_executes_prompt_for_all_profiles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_hi_runner(Box::new(FakeHiRunner::success()));
+
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        let work_metadata = app.new_metadata(work.clone(), &work_auth).unwrap();
+        app.save_profile(&work_metadata, &work_auth).unwrap();
+
+        let results = app.hi("hi").unwrap();
+
+        assert_eq!(results.len(), 2);
+        let personal = results.iter().find(|r| r.name.as_str() == "personal").unwrap();
+        assert!(personal.active);
+        assert_eq!(personal.reply.as_deref(), Ok("reply to hi for personal@example.com"));
+
+        let work_res = results.iter().find(|r| r.name.as_str() == "work").unwrap();
+        assert!(!work_res.active);
+        assert_eq!(work_res.reply.as_deref(), Ok("reply to hi for work@example.com"));
+    }
+
+    #[test]
+    fn hi_continues_when_single_profile_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_hi_runner(Box::new(FakeHiRunner::with_failing_email("work@example.com")));
+
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        let work_metadata = app.new_metadata(work.clone(), &work_auth).unwrap();
+        app.save_profile(&work_metadata, &work_auth).unwrap();
+
+        let results = app.hi("hi").unwrap();
+
+        assert_eq!(results.len(), 2);
+        let personal = results.iter().find(|r| r.name.as_str() == "personal").unwrap();
+        assert!(personal.reply.is_ok());
+
+        let work_res = results.iter().find(|r| r.name.as_str() == "work").unwrap();
+        assert!(work_res.reply.is_err());
+    }
+
+    #[test]
+    fn hi_reports_unhealthy_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_hi_runner(Box::new(FakeHiRunner::success()));
+
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let broken = ProfileName::parse("broken").unwrap();
+        let broken_dir = app.paths().profile_dir(&broken);
+        fs::create_dir_all(&broken_dir).unwrap();
+        let broken_auth = app.paths().profile_auth_path(&broken);
+        fs::write(&broken_auth, b"invalid json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&broken_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let results = app.hi("hi").unwrap();
+        let broken_res = results.iter().find(|r| r.name.as_str() == "broken").unwrap();
+        assert!(broken_res.reply.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_exec_hi_runner_invokes_codex_exec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("fake-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "exec" ] && echo "$*" | grep -q "hi$"; then
+  printf "hello from model\n"
+  exit 0
+fi
+printf "unexpected args: %s\n" "$*" >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runner = CodexExecHiRunner::from_path(script);
+        let (reply, _updated_auth) = runner.send_hi(&auth("work@example.com", 1), "hi").unwrap();
+
+        assert_eq!(reply, "hello from model");
+    }
+
+    #[test]
+    fn list_persists_refreshed_active_auth_to_the_profile_and_live_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(FakeUsageReader::with_refreshed_auth(auth(
+            "work@example.com",
+            2,
+        ))));
+
+        write_live_auth(&app, &auth("work@example.com", 1));
+        app.init().unwrap();
+
+        let initial_meta = app
+            .load_profile(&ProfileName::parse("work").unwrap())
+            .unwrap();
+
+        let profiles = app.list().unwrap();
+        assert_eq!(profiles.len(), 1);
+
+        // The active profile uses the default live home, so both copies stay in sync.
+        let live = app.read_live_auth().unwrap();
+        assert_eq!(live, auth("work@example.com", 2));
+
+        let vault = app
+            .read_profile_auth(&ProfileName::parse("work").unwrap())
+            .unwrap();
+        assert_eq!(vault, auth("work@example.com", 2));
+
+        let updated_meta = app
+            .load_profile(&ProfileName::parse("work").unwrap())
+            .unwrap();
+        assert!(updated_meta.last_synced_at >= initial_meta.last_synced_at);
+    }
+
+    #[test]
+    fn list_skips_a_non_active_profile_while_it_is_running() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(FakeUsageReader::with_refreshed_auth(auth(
+            "work@example.com",
+            2,
+        ))));
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        app.save_profile(&app.new_metadata(work.clone(), &work_auth).unwrap(), &work_auth)
+            .unwrap();
+
+        let runtime_lease = app.acquire_runtime_lock_shared(&work).unwrap();
+        let work_entry = app
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == work)
+            .unwrap();
+        drop(runtime_lease);
+
+        assert!(matches!(work_entry.usage, UsageStatus::Unavailable(message) if message.contains("currently in use")));
+        assert_eq!(app.read_profile_auth(&work).unwrap(), work_auth);
+    }
+
+    #[test]
+    fn active_usage_and_hi_do_not_refresh_while_a_default_client_is_running() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let guard = CloseableProcessGuard::new();
+        let usage_queried = Arc::new(AtomicBool::new(false));
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(guard),
+        )
+        .with_usage_reader(Box::new(CountingUsageReader(usage_queried.clone())))
+        .with_hi_runner(Box::new(FakeHiRunner::with_refreshed_auth(auth(
+            "personal@example.com",
+            2,
+        ))));
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+
+        assert!(matches!(
+            app.current_live_usage().unwrap(),
+            UsageStatus::Unavailable(message) if message.contains("client is running")
+        ));
+        assert!(!usage_queried.load(Ordering::SeqCst));
+        let result = app.hi("hi").unwrap().pop().unwrap();
+
+        assert!(matches!(result.reply, Err(message) if message.contains("prompt was not sent")));
+        assert_eq!(app.read_live_auth().unwrap(), original_auth);
+        assert_eq!(
+            app.read_profile_auth(&ProfileName::parse("personal").unwrap())
+                .unwrap(),
+            original_auth
+        );
+    }
+
+    #[test]
+    fn current_live_usage_persists_refreshed_auth_to_vault_and_live() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(FakeUsageReader::with_refreshed_auth(auth(
+            "personal@example.com",
+            2,
+        ))));
+
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+
+        let status_usage = app.current_live_usage().unwrap();
+        assert!(matches!(status_usage, UsageStatus::Available(_)));
+
+        // Verify live auth and vault auth were updated to version 2
+        let live = app.read_live_auth().unwrap();
+        assert_eq!(live, auth("personal@example.com", 2));
+
+        let vault = app
+            .read_profile_auth(&ProfileName::parse("personal").unwrap())
+            .unwrap();
+        assert_eq!(vault, auth("personal@example.com", 2));
+    }
+
+    #[test]
+    fn hi_persists_refreshed_auth_to_vault_and_live() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_hi_runner(Box::new(FakeHiRunner::with_refreshed_auth(auth(
+            "work@example.com",
+            2,
+        ))));
+
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        let work_metadata = app.new_metadata(work.clone(), &work_auth).unwrap();
+        app.save_profile(&work_metadata, &work_auth).unwrap();
+
+        let results = app.hi("hi").unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Verify work profile in vault was updated to version 2
+        let vault = app.read_profile_auth(&work).unwrap();
+        assert_eq!(vault, auth("work@example.com", 2));
     }
 }

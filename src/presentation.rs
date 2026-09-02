@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local, Utc};
 use codex_handoff::{
-    LocalHealth, ProfileListEntry, ProfileMetadata, ResetCredits, UsageBucket, UsageReport,
-    UsageStatus, UsageWindow,
+    HiProfileResult, LocalHealth, ProfileListEntry, ProfileMetadata, ResetCredits, UsageBucket,
+    UsageReport, UsageStatus, UsageWindow,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use console::{Style, measure_text_width};
@@ -24,6 +24,76 @@ pub fn default_color_mode() -> ColorMode {
 pub fn terminal_width() -> u16 {
     let width = console::Term::stdout().size().1;
     if width == 0 { 110 } else { width.min(110) }
+}
+
+pub fn render_hi_results(results: &[HiProfileResult], prompt: &str) -> String {
+    let colors = colors_enabled(default_color_mode());
+    render_hi_results_with_colors(results, prompt, colors)
+}
+
+pub fn render_hi_results_with_colors(
+    results: &[HiProfileResult],
+    prompt: &str,
+    colors: bool,
+) -> String {
+    if results.is_empty() {
+        return "No profiles saved. Run `ch init` first.".to_string();
+    }
+    let count = results.len();
+    let profile_word = if count == 1 { "profile" } else { "profiles" };
+    let mut output = format!("Sending \"{}\" to {} {}...\n", prompt, count, profile_word);
+
+    let mut succeeded = 0;
+    let mut failed = 0;
+
+    for result in results {
+        output.push('\n');
+        let active_marker = if result.active {
+            format!(" {}", paint("ACTIVE", Accent::Success, colors))
+        } else {
+            String::new()
+        };
+
+        output.push_str(&format!(
+            "● {}{}\n  {}  {}\n",
+            paint(result.name.as_str(), Accent::Title, colors),
+            active_marker,
+            paint("Email", Accent::Muted, colors),
+            result.email,
+        ));
+
+        match &result.reply {
+            Ok(reply) => {
+                succeeded += 1;
+                let check = paint("✓", Accent::Success, colors);
+                output.push_str(&format!("  {check} {reply}\n"));
+            }
+            Err(error) => {
+                failed += 1;
+                let cross = paint("✗", Accent::Danger, colors);
+                let fail_label = paint("Failed:", Accent::Danger, colors);
+                output.push_str(&format!("  {cross} {fail_label} {error}\n"));
+            }
+        }
+    }
+
+    output.push('\n');
+    let summary = if failed == 0 {
+        format!(
+            "Summary: {} succeeded (all accounts OK)",
+            paint(&succeeded.to_string(), Accent::Success, colors)
+        )
+    } else {
+        format!(
+            "Summary: {} succeeded, {} failed (total {})",
+            paint(&succeeded.to_string(), Accent::Success, colors),
+            paint(&failed.to_string(), Accent::Danger, colors),
+            count
+        )
+    };
+    output.push_str(&summary);
+
+    output
 }
 
 pub fn render_list(entries: &[ProfileListEntry]) -> String {
@@ -672,5 +742,49 @@ mod tests {
         assert!(output.contains("Full reset"));
         assert!(!output.contains('┌'));
         assert!(output.lines().all(|line| measure_text_width(line) <= 40));
+    }
+
+    #[test]
+    fn renders_hi_results_with_success_and_failures() {
+        let results = vec![
+            HiProfileResult {
+                name: ProfileName::parse("personal").unwrap(),
+                email: "personal@example.com".into(),
+                active: true,
+                reply: Ok("Hello! How can I help you?".into()),
+            },
+            HiProfileResult {
+                name: ProfileName::parse("work").unwrap(),
+                email: "work@example.com".into(),
+                active: false,
+                reply: Err("rate limit reached".into()),
+            },
+        ];
+
+        let plain = render_hi_results_with_colors(&results, "hi", false);
+        assert!(plain.contains("Sending \"hi\" to 2 profiles..."));
+        assert!(plain.contains("personal ACTIVE"));
+        assert!(plain.contains("personal@example.com"));
+        assert!(plain.contains("✓ Hello! How can I help you?"));
+        assert!(plain.contains("work"));
+        assert!(plain.contains("✗ Failed: rate limit reached"));
+        assert!(plain.contains("Summary: 1 succeeded, 1 failed (total 2)"));
+        assert!(!plain.contains('\u{1b}'));
+
+        let colored = render_hi_results_with_colors(&results, "hi", true);
+        assert!(colored.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_hi_results_when_all_succeed() {
+        let results = vec![HiProfileResult {
+            name: ProfileName::parse("personal").unwrap(),
+            email: "personal@example.com".into(),
+            active: false,
+            reply: Ok("Hello!".into()),
+        }];
+
+        let plain = render_hi_results_with_colors(&results, "hi", false);
+        assert!(plain.contains("Summary: 1 succeeded (all accounts OK)"));
     }
 }

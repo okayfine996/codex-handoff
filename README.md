@@ -26,6 +26,9 @@ ch list
 
 # Safely move the live Codex session to a profile.
 ch switch work
+
+# Start an isolated Codex CLI session without changing the live account.
+ch run work
 ```
 
 `init` and `add` derive profile names from the local part of the authenticated
@@ -42,13 +45,48 @@ email address. For example, `litesky+codex@example.com` becomes
 | `ch list` | Show all profiles, local health, and quota dashboards. |
 | `ch status` | Show the active live profile, its quota, and configured paths. |
 | `ch switch <name> [--force / --close-clients]` | Verify a profile online, sync the current one, then atomically activate it. |
+| `ch run <name> [-- <codex args>...]` | Start Codex with the selected profile; the active profile uses the default `CODEX_HOME`, while other profiles use their persistent profile home. |
 | `ch sync [-f]` | Save the latest live token refresh back to the active profile. |
+| `ch hi [prompt]` | Send a prompt ("hi" by default) to Codex across all saved accounts. |
 | `ch doctor` | Check the Codex CLI, vault consistency, permissions, locks, and running clients. |
 
 `-f` / `--force` bypasses only the running-client check. It never bypasses
 file validation or online authentication verification. `-c` /
-`--close-clients` is available on `switch`; it asks Codex and ChatGPT to quit,
-then waits up to five seconds. `-f` and `-c` cannot be combined.
+`--close-clients` is available on `switch`; it asks only the default
+Codex/ChatGPT lane to quit, then waits up to five seconds. A `ch run` session
+for the target profile must be ended manually. `-f` and `-c` cannot be combined.
+
+## Parallel CLI sessions
+
+Use `ch run` when you need multiple authorized accounts at once. A non-active
+profile leaves the default `~/.codex/auth.json` untouched, so `switch` remains
+the command for changing the account used by Codex Desktop, a direct `codex`
+invocation, and existing scripts.
+
+```sh
+# Separate terminals can use separate profiles at the same time.
+ch run personal
+ch run work -- -C ~/src/client --no-alt-screen
+```
+
+For the active profile, `ch run` deliberately uses the normal default
+`CODEX_HOME`; it behaves exactly like launching `codex` directly and can share
+the account with Codex Desktop. For every non-active profile, the saved profile
+directory is its persistent `CODEX_HOME`. On the first such `run`, `ch` copies
+`config.toml` and `*.config.toml` from the default Codex home when present;
+later changes are profile-specific. It never copies authentication, session
+history, or plugin installations.
+
+Native Codex supports multiple instances of one account, so active-profile
+sessions are not artificially serialized. Non-active sessions for the same
+profile also run concurrently, but `ch` holds a shared runtime lock while they
+run: `list` and `hi` report that profile as busy instead of refreshing its auth
+file concurrently.
+
+`switch` remains necessary because Codex Desktop and a plain `codex` invocation
+always use the default home. It blocks only the default lane (the current active
+account) and any `ch run` session for the target profile; unrelated profile
+sessions keep running. `--close-clients` closes only the default lane.
 
 ## Quota dashboard
 
@@ -58,11 +96,15 @@ Green means less than 50% used, yellow 50–79%, and red 80% or more. The output
 also shows reset times, reached limits, spend-control warnings, and available
 reset credits.
 
-`ch status` uses the same dashboard for only the active live account. A quota
-query refreshes credentials only inside its isolated temporary `CODEX_HOME`;
-it never writes the live or vault authentication file. If one account's remote
-query fails, `ch` displays `Usage unavailable` for that profile without
-affecting the other accounts or any switching operation.
+`ch status` uses the same dashboard for only the active live account. When a quota
+query or `hi` prompt triggers a credential refresh, `ch` automatically persists the
+updated tokens back to the vault profile (and the live `auth.json` for the active
+account) to keep OAuth refresh token rotations in sync. To avoid racing an active
+client, `status`, `list`, and `hi` do not run a temporary refresh for the default
+account while Codex or ChatGPT is running; `list` and `hi` similarly skip a
+non-active profile that is currently running through `ch`. If one account's remote
+query fails, `ch` displays `Usage unavailable` for that profile without affecting
+the other accounts or any switching operation.
 
 Color is enabled only in an interactive terminal. Piped or redirected output,
 and environments with `NO_COLOR` set, remain plain text with no ANSI escape
