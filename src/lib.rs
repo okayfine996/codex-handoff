@@ -124,6 +124,8 @@ pub enum HandoffError {
     Busy,
     #[error("profile `{0}` is currently in use")]
     ProfileBusy(String),
+    #[error("profile `{0}` changed while authentication was being refreshed; retry the operation")]
+    ProfileChanged(String),
     #[error("authentication preflight failed: {0}")]
     Preflight(String),
     #[error("usage query failed: {0}")]
@@ -1330,16 +1332,7 @@ impl App {
         self.ensure_profile_email(&status.active, &auth)?;
         match self.usage_reader.read(&auth) {
             Ok((usage_report, updated_auth)) => {
-                if updated_auth != auth {
-                    let _ = self.write_auth(&self.paths.live_auth_path(), &updated_auth);
-                    let _ = self.write_auth(
-                        &self.paths.profile_auth_path(&status.active.name),
-                        &updated_auth,
-                    );
-                    let mut meta = status.active.clone();
-                    meta.last_synced_at = Utc::now();
-                    let _ = self.save_metadata(&meta);
-                }
+                self.persist_refreshed_auth(&status.active, &auth, &updated_auth, true)?;
                 Ok(UsageStatus::Available(usage_report))
             }
             Err(error) => Ok(UsageStatus::Unavailable(error.to_string())),
@@ -1485,24 +1478,15 @@ impl App {
                     let reply = match auth {
                         Ok(auth) => match self.ensure_profile_email(metadata, &auth) {
                             Ok(()) => match self.hi_runner.send_hi(&auth, prompt) {
-                                Ok((msg, updated_auth)) => {
-                                    if updated_auth != auth {
-                                        let _ = self.write_auth(
-                                            &self.paths.profile_auth_path(&name),
-                                            &updated_auth,
-                                        );
-                                        let mut meta = metadata.clone();
-                                        meta.last_synced_at = Utc::now();
-                                        let _ = self.save_metadata(&meta);
-                                        if is_active {
-                                            let _ = self.write_auth(
-                                                &self.paths.live_auth_path(),
-                                                &updated_auth,
-                                            );
-                                        }
-                                    }
-                                    Ok(msg)
-                                }
+                                Ok((msg, updated_auth)) => self
+                                    .persist_refreshed_auth(
+                                        metadata,
+                                        &auth,
+                                        &updated_auth,
+                                        is_active,
+                                    )
+                                    .map(|()| msg)
+                                    .map_err(|error| error.to_string()),
                                 Err(error) => Err(error.to_string()),
                             },
                             Err(error) => Err(error.to_string()),
@@ -2084,16 +2068,15 @@ impl App {
         });
         let usage = match result {
             Ok((report, original_auth, updated_auth)) => {
-                if updated_auth != original_auth {
-                    let _ = self.write_auth(&self.paths.profile_auth_path(name), &updated_auth);
-                    if is_active {
-                        let _ = self.write_auth(&self.paths.live_auth_path(), &updated_auth);
-                    }
-                    let mut refreshed_metadata = metadata.clone();
-                    refreshed_metadata.last_synced_at = Utc::now();
-                    let _ = self.save_metadata(&refreshed_metadata);
+                match self.persist_refreshed_auth(
+                    metadata,
+                    &original_auth,
+                    &updated_auth,
+                    is_active,
+                ) {
+                    Ok(()) => UsageStatus::Available(report),
+                    Err(error) => UsageStatus::Unavailable(error.to_string()),
                 }
-                UsageStatus::Available(report)
             }
             Err(error) => UsageStatus::Unavailable(error.to_string()),
         };
@@ -2106,6 +2089,50 @@ impl App {
             &self.paths.profile_metadata_path(&profile.name),
             &serde_json::to_vec_pretty(profile)?,
         )
+    }
+
+    fn persist_refreshed_auth(
+        &self,
+        profile: &ProfileMetadata,
+        original_auth: &[u8],
+        refreshed_auth: &[u8],
+        was_active: bool,
+    ) -> Result<(), HandoffError> {
+        if refreshed_auth == original_auth {
+            return Ok(());
+        }
+        self.ensure_profile_email(profile, refreshed_auth)?;
+
+        let _lock = self.lock()?;
+        let is_active = self.load_state()?.active_profile == profile.name;
+        let persisted_auth = if is_active {
+            self.read_live_auth()?
+        } else {
+            self.read_profile_auth(&profile.name)?
+        };
+        if is_active != was_active || persisted_auth != original_auth {
+            return Err(HandoffError::ProfileChanged(profile.name.as_str().into()));
+        }
+
+        let mut refreshed_profile = self.load_profile(&profile.name)?;
+        self.ensure_profile_email(&refreshed_profile, refreshed_auth)?;
+        refreshed_profile.last_synced_at = Utc::now();
+        let mut paths = vec![
+            self.paths.profile_auth_path(&profile.name),
+            self.paths.profile_metadata_path(&profile.name),
+        ];
+        if is_active {
+            paths.push(self.paths.live_auth_path());
+        }
+
+        self.transaction(paths, || {
+            self.write_auth(&self.paths.profile_auth_path(&profile.name), refreshed_auth)?;
+            self.save_metadata(&refreshed_profile)?;
+            if is_active {
+                self.write_auth(&self.paths.live_auth_path(), refreshed_auth)?;
+            }
+            Ok(())
+        })
     }
 
     fn load_state(&self) -> Result<State, HandoffError> {
@@ -2389,6 +2416,17 @@ mod tests {
         refreshed_auth: Option<Vec<u8>>,
     }
 
+    struct MetadataBlockingUsageReader {
+        metadata_path: std::path::PathBuf,
+        refreshed_auth: Vec<u8>,
+    }
+
+    struct AuthChangingUsageReader {
+        auth_paths: Vec<std::path::PathBuf>,
+        concurrent_auth: Vec<u8>,
+        refreshed_auth: Vec<u8>,
+    }
+
     impl FakeUsageReader {
         fn new() -> Self {
             Self {
@@ -2433,6 +2471,23 @@ mod tests {
         }
     }
 
+    impl UsageReader for MetadataBlockingUsageReader {
+        fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
+            fs::remove_file(&self.metadata_path)?;
+            fs::create_dir(&self.metadata_path)?;
+            FakeUsageReader::with_refreshed_auth(self.refreshed_auth.clone()).read(auth)
+        }
+    }
+
+    impl UsageReader for AuthChangingUsageReader {
+        fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
+            for path in &self.auth_paths {
+                fs::write(path, &self.concurrent_auth)?;
+            }
+            FakeUsageReader::with_refreshed_auth(self.refreshed_auth.clone()).read(auth)
+        }
+    }
+
     impl UsageReader for CountingUsageReader {
         fn read(&self, _auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
             self.0.store(true, Ordering::SeqCst);
@@ -2443,6 +2498,11 @@ mod tests {
     struct FakeHiRunner {
         fail_email: Option<String>,
         refreshed_auth: Option<Vec<u8>>,
+    }
+
+    struct MetadataBlockingHiRunner {
+        metadata_path: std::path::PathBuf,
+        refreshed_auth: Vec<u8>,
     }
 
     impl FakeHiRunner {
@@ -2476,6 +2536,14 @@ mod tests {
             }
             let updated = self.refreshed_auth.clone().unwrap_or_else(|| auth.to_vec());
             Ok((format!("reply to {prompt} for {email}"), updated))
+        }
+    }
+
+    impl HiRunner for MetadataBlockingHiRunner {
+        fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError> {
+            fs::remove_file(&self.metadata_path)?;
+            fs::create_dir(&self.metadata_path)?;
+            FakeHiRunner::with_refreshed_auth(self.refreshed_auth.clone()).send_hi(auth, prompt)
         }
     }
 
@@ -3572,6 +3640,172 @@ exit 1
             .read_profile_auth(&ProfileName::parse("personal").unwrap())
             .unwrap();
         assert_eq!(vault, auth("personal@example.com", 2));
+    }
+
+    #[test]
+    fn current_live_usage_does_not_report_success_when_refreshed_auth_cannot_be_persisted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let profile = ProfileName::parse("personal").unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let metadata_path = paths.profile_metadata_path(&profile);
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(MetadataBlockingUsageReader {
+            metadata_path,
+            refreshed_auth: auth("personal@example.com", 2),
+        }));
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+
+        let result = app.current_live_usage();
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(app.paths().live_auth_path()).unwrap(),
+            original_auth
+        );
+        assert_eq!(
+            fs::read(app.paths().profile_auth_path(&profile)).unwrap(),
+            auth("personal@example.com", 1)
+        );
+    }
+
+    #[test]
+    fn current_live_usage_rejects_refreshed_auth_for_another_account() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(FakeUsageReader::with_refreshed_auth(auth(
+            "other@example.com",
+            2,
+        ))));
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+
+        let result = app.current_live_usage();
+
+        assert!(matches!(result, Err(HandoffError::EmailMismatch { .. })));
+        assert_eq!(app.read_live_auth().unwrap(), original_auth);
+        assert_eq!(
+            app.read_profile_auth(&ProfileName::parse("personal").unwrap())
+                .unwrap(),
+            auth("personal@example.com", 1)
+        );
+    }
+
+    #[test]
+    fn current_live_usage_does_not_overwrite_auth_changed_during_refresh() {
+        let temporary = tempfile::tempdir().unwrap();
+        let profile = ProfileName::parse("personal").unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let auth_paths = vec![paths.live_auth_path(), paths.profile_auth_path(&profile)];
+        let concurrent_auth = auth("personal@example.com", 3);
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(AuthChangingUsageReader {
+            auth_paths,
+            concurrent_auth: concurrent_auth.clone(),
+            refreshed_auth: auth("personal@example.com", 2),
+        }));
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+
+        let result = app.current_live_usage();
+
+        assert!(matches!(result, Err(HandoffError::ProfileChanged(_))));
+        assert_eq!(app.read_live_auth().unwrap(), concurrent_auth);
+        assert_eq!(app.read_profile_auth(&profile).unwrap(), concurrent_auth);
+    }
+
+    #[test]
+    fn list_marks_usage_unavailable_when_refreshed_auth_cannot_be_persisted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let profile = ProfileName::parse("personal").unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let metadata_path = paths.profile_metadata_path(&profile);
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_usage_reader(Box::new(MetadataBlockingUsageReader {
+            metadata_path,
+            refreshed_auth: auth("personal@example.com", 2),
+        }));
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+
+        let profile = app.list().unwrap().pop().unwrap();
+
+        assert!(matches!(profile.usage, UsageStatus::Unavailable(_)));
+        assert_eq!(
+            fs::read(app.paths().live_auth_path()).unwrap(),
+            original_auth
+        );
+        assert_eq!(
+            fs::read(app.paths().profile_auth_path(&profile.name)).unwrap(),
+            auth("personal@example.com", 1)
+        );
+    }
+
+    #[test]
+    fn hi_marks_reply_failed_when_refreshed_auth_cannot_be_persisted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let profile = ProfileName::parse("personal").unwrap();
+        let paths = AppPaths::new(
+            temporary.path().join("codex"),
+            temporary.path().join("vault"),
+        );
+        let metadata_path = paths.profile_metadata_path(&profile);
+        let app = App::with_components(
+            paths,
+            Box::new(StaticProbe::success()),
+            Box::new(NoopProcessGuard),
+        )
+        .with_hi_runner(Box::new(MetadataBlockingHiRunner {
+            metadata_path,
+            refreshed_auth: auth("personal@example.com", 2),
+        }));
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+
+        let result = app.hi("hi").unwrap().pop().unwrap();
+
+        assert!(result.reply.is_err());
+        assert_eq!(
+            fs::read(app.paths().live_auth_path()).unwrap(),
+            original_auth
+        );
+        assert_eq!(
+            fs::read(app.paths().profile_auth_path(&profile)).unwrap(),
+            auth("personal@example.com", 1)
+        );
     }
 
     #[test]
