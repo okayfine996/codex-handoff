@@ -14,9 +14,13 @@ use std::{
 };
 use thiserror::Error;
 
+mod activity;
 mod app_server;
+mod profile_inventory;
 
+use activity::ActivityLease;
 use app_server::{AppServerSession, Operation as AppServerOperation};
+use profile_inventory::InventoryEntry;
 
 const SCHEMA_VERSION: u8 = 1;
 
@@ -251,19 +255,19 @@ struct SwitchClientScope {
     target_sessions: Vec<ClientProcess>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Status {
     pub active: ProfileMetadata,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UsageWindow {
     pub used_percent: u8,
     pub resets_at: Option<i64>,
     pub window_duration_mins: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UsageBucket {
     pub id: String,
     pub primary: Option<UsageWindow>,
@@ -272,36 +276,60 @@ pub struct UsageBucket {
     pub spend_control_reached: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ResetCredit {
     pub title: Option<String>,
     pub description: Option<String>,
     pub status: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ResetCredits {
     pub available_count: u64,
     pub credits: Vec<ResetCredit>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UsageReport {
     pub buckets: Vec<UsageBucket>,
     pub reset_credits: Option<ResetCredits>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum UsageStatus {
     Available(UsageReport),
     Unavailable(String),
     NotQueried,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "reason", rename_all = "snake_case")]
 pub enum LocalHealth {
     Healthy,
     Unhealthy(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Pass,
+    Warning,
+    Fail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DoctorCheck {
+    pub id: String,
+    pub label: String,
+    pub status: DoctorStatus,
+    pub message: String,
+}
+
+impl DoctorCheck {
+    fn line(&self) -> String {
+        format!("{}: {}", self.label, self.message)
+    }
 }
 
 impl fmt::Display for LocalHealth {
@@ -313,7 +341,7 @@ impl fmt::Display for LocalHealth {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProfileListEntry {
     pub name: ProfileName,
     pub metadata: Option<ProfileMetadata>,
@@ -322,7 +350,7 @@ pub struct ProfileListEntry {
     pub usage: UsageStatus,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct HiProfileResult {
     pub name: ProfileName,
     pub email: String,
@@ -330,16 +358,25 @@ pub struct HiProfileResult {
     pub reply: Result<String, String>,
 }
 
-#[derive(Clone)]
-struct InventoryEntry {
-    name: ProfileName,
-    metadata: Option<ProfileMetadata>,
-    active: bool,
-    health: LocalHealth,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BestEvaluation {
+    pub profile: ProfileName,
+    pub eligible: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BestRecommendation {
+    pub profile: Option<ProfileName>,
+    pub evaluations: Vec<BestEvaluation>,
 }
 
 pub trait AuthProbe: Send + Sync {
     fn probe(&self, auth: &[u8]) -> Result<Vec<u8>, HandoffError>;
+
+    fn check_compatibility(&self) -> Result<(), HandoffError> {
+        Ok(())
+    }
 }
 
 pub trait UsageReader: Send + Sync {
@@ -603,6 +640,16 @@ impl AuthProbe for AppServerProbe {
         let updated_auth = session.read_auth()?;
         parse_auth(&updated_auth)?;
         Ok(updated_auth)
+    }
+
+    fn check_compatibility(&self) -> Result<(), HandoffError> {
+        let mut session = AppServerSession::start(
+            &self.codex_binary,
+            b"{}",
+            AppServerOperation::Preflight,
+            Duration::from_secs(5),
+        )?;
+        session.initialize()
     }
 }
 
@@ -1290,27 +1337,17 @@ impl App {
         Ok(profiles)
     }
 
+    pub fn best(&self, concurrency: usize) -> Result<BestRecommendation, HandoffError> {
+        Ok(best_from_entries(
+            &self.list_with_concurrency(true, concurrency)?,
+        ))
+    }
+
     fn profile_inventory(&self) -> Result<Vec<InventoryEntry>, HandoffError> {
         let active = self.load_state().ok().map(|state| state.active_profile);
-        let mut profiles = Vec::new();
-        if !self.paths.profiles_dir().exists() {
-            return Ok(profiles);
-        }
-        for entry in fs::read_dir(self.paths.profiles_dir())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(name) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| ProfileName::parse(name).ok())
-            else {
-                continue;
-            };
-            let is_active = active.as_ref() == Some(&name);
-            let (metadata, health) = match self.load_profile(&name) {
-                Ok(metadata) => match self.read_profile_auth(&name) {
+        profile_inventory::scan(&self.paths.profiles_dir(), active.as_ref(), |name| {
+            let (metadata, health) = match self.load_profile(name) {
+                Ok(metadata) => match self.read_profile_auth(name) {
                     Ok(auth) => match self.ensure_profile_email(&metadata, &auth) {
                         Ok(()) => (Some(metadata), LocalHealth::Healthy),
                         Err(error) => (Some(metadata), LocalHealth::Unhealthy(error.to_string())),
@@ -1319,15 +1356,8 @@ impl App {
                 },
                 Err(error) => (None, LocalHealth::Unhealthy(error.to_string())),
             };
-            profiles.push(InventoryEntry {
-                name,
-                metadata,
-                active: is_active,
-                health,
-            });
-        }
-        profiles.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        Ok(profiles)
+            (metadata, health)
+        })
     }
 
     pub fn hi(&self, prompt: &str) -> Result<Vec<HiProfileResult>, HandoffError> {
@@ -1744,62 +1774,134 @@ impl App {
     }
 
     pub fn doctor(&self) -> Vec<String> {
+        self.doctor_checks()
+            .into_iter()
+            .map(|check| check.line())
+            .collect()
+    }
+
+    pub fn doctor_checks(&self) -> Vec<DoctorCheck> {
         let mut items = Vec::new();
-        items.push(match self.login_runner.binary_path() {
+        let (status, message) = match self.login_runner.binary_path() {
             Some(binary) => match Command::new(binary).arg("--version").output() {
-                Ok(output) if output.status.success() => format!(
-                    "Codex CLI: ok ({})",
-                    String::from_utf8_lossy(&output.stdout).trim()
+                Ok(output) if output.status.success() => (
+                    DoctorStatus::Pass,
+                    format!("ok ({})", String::from_utf8_lossy(&output.stdout).trim()),
                 ),
-                Ok(_) => "Codex CLI: error (could not read version)".into(),
-                Err(error) => format!("Codex CLI: error ({error})"),
+                Ok(_) => (DoctorStatus::Fail, "error (could not read version)".into()),
+                Err(error) => (DoctorStatus::Fail, format!("error ({error})")),
             },
-            None => "Codex CLI: unavailable".into(),
+            None => (DoctorStatus::Warning, "unavailable".into()),
+        };
+        items.push(DoctorCheck {
+            id: "codex_cli".into(),
+            label: "Codex CLI".into(),
+            status,
+            message,
         });
-        items.push(format!(
-            "vault: {}",
-            if private_path_is_safe(self.paths.handoff_home(), true) {
+        let vault_safe = private_path_is_safe(self.paths.handoff_home(), true);
+        items.push(DoctorCheck {
+            id: "vault".into(),
+            label: "vault".into(),
+            status: if vault_safe {
+                DoctorStatus::Pass
+            } else {
+                DoctorStatus::Fail
+            },
+            message: if vault_safe {
                 "ok"
             } else {
                 "missing or insecure"
             }
-        ));
-        items.push(format!(
-            "live auth: {}",
-            if self
-                .read_live_auth()
-                .and_then(|auth| parse_auth(&auth).map(|_| ()))
-                .is_ok()
-            {
+            .into(),
+        });
+        let live_auth_safe = self
+            .read_live_auth()
+            .and_then(|auth| parse_auth(&auth).map(|_| ()))
+            .is_ok();
+        items.push(DoctorCheck {
+            id: "live_auth".into(),
+            label: "live auth".into(),
+            status: if live_auth_safe {
+                DoctorStatus::Pass
+            } else {
+                DoctorStatus::Fail
+            },
+            message: if live_auth_safe {
                 "ok"
             } else {
                 "missing, invalid, or unreadable"
             }
-        ));
+            .into(),
+        });
+        let (status, message) = match self.probe.check_compatibility() {
+            Ok(()) => (DoctorStatus::Pass, "ok".into()),
+            Err(error) => (DoctorStatus::Fail, format!("error ({error})")),
+        };
+        items.push(DoctorCheck {
+            id: "app_server_protocol".into(),
+            label: "app-server protocol".into(),
+            status,
+            message,
+        });
         match self.status() {
-            Ok(status) => items.push(format!(
-                "active profile: {} ({})",
-                status.active.name.as_str(),
-                status.active.email
-            )),
-            Err(error) => items.push(format!("active profile: error ({error})")),
+            Ok(status) => items.push(DoctorCheck {
+                id: "active_profile".into(),
+                label: "active profile".into(),
+                status: DoctorStatus::Pass,
+                message: format!("{} ({})", status.active.name.as_str(), status.active.email),
+            }),
+            Err(error) => items.push(DoctorCheck {
+                id: "active_profile".into(),
+                label: "active profile".into(),
+                status: DoctorStatus::Fail,
+                message: format!("error ({error})"),
+            }),
         }
         match self.list_with_usage(false) {
             Ok(entries) => {
                 for entry in entries {
-                    items.push(format!("profile {}: {}", entry.name.as_str(), entry.health));
+                    let status = if entry.health == LocalHealth::Healthy {
+                        DoctorStatus::Pass
+                    } else {
+                        DoctorStatus::Fail
+                    };
+                    items.push(DoctorCheck {
+                        id: format!("profile.{}", entry.name.as_str()),
+                        label: format!("profile {}", entry.name.as_str()),
+                        status,
+                        message: entry.health.to_string(),
+                    });
                 }
             }
-            Err(error) => items.push(format!("profiles: error ({error})")),
+            Err(error) => items.push(DoctorCheck {
+                id: "profiles".into(),
+                label: "profiles".into(),
+                status: DoctorStatus::Fail,
+                message: format!("error ({error})"),
+            }),
         }
-        items.push(match self.process_guard.ensure_stopped(false) {
-            Ok(()) => "client processes: stopped".into(),
-            Err(HandoffError::ClientRunning) => "client processes: running".into(),
-            Err(error) => format!("client processes: error ({error})"),
+        let (status, message) = match self.process_guard.ensure_stopped(false) {
+            Ok(()) => (DoctorStatus::Pass, "stopped".into()),
+            Err(HandoffError::ClientRunning) => (DoctorStatus::Warning, "running".into()),
+            Err(error) => (DoctorStatus::Fail, format!("error ({error})")),
+        };
+        items.push(DoctorCheck {
+            id: "client_processes".into(),
+            label: "client processes".into(),
+            status,
+            message,
         });
-        items.push(match self.lock_status() {
-            Ok(status) => format!("lock: {status}"),
-            Err(error) => format!("lock: error ({error})"),
+        let (status, message) = match self.lock_status() {
+            Ok("busy") => (DoctorStatus::Warning, "busy".into()),
+            Ok(message) => (DoctorStatus::Pass, message.into()),
+            Err(error) => (DoctorStatus::Fail, format!("error ({error})")),
+        };
+        items.push(DoctorCheck {
+            id: "lock".into(),
+            label: "lock".into(),
+            status,
+            message,
         });
         items
     }
@@ -1964,30 +2066,26 @@ impl App {
         self.atomic_write(&marker, b"initialized\n")
     }
 
-    fn acquire_runtime_lock_shared(&self, name: &ProfileName) -> Result<File, HandoffError> {
-        let file = self.open_runtime_lock(name)?;
-        file.try_lock_shared()
-            .map_err(|_| HandoffError::ProfileBusy(name.as_str().into()))?;
-        Ok(file)
+    fn acquire_runtime_lock_shared(
+        &self,
+        name: &ProfileName,
+    ) -> Result<ActivityLease, HandoffError> {
+        activity::acquire_shared(
+            &self.paths.runtime_locks_dir(),
+            &self.paths.runtime_lock_path(name),
+            name,
+        )
     }
 
-    fn acquire_runtime_lock_exclusive(&self, name: &ProfileName) -> Result<File, HandoffError> {
-        let file = self.open_runtime_lock(name)?;
-        file.try_lock_exclusive()
-            .map_err(|_| HandoffError::ProfileBusy(name.as_str().into()))?;
-        Ok(file)
-    }
-
-    fn open_runtime_lock(&self, name: &ProfileName) -> Result<File, HandoffError> {
-        private_dir(&self.paths.runtime_locks_dir())?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.paths.runtime_lock_path(name))?;
-        private_file(&file)?;
-        Ok(file)
+    fn acquire_runtime_lock_exclusive(
+        &self,
+        name: &ProfileName,
+    ) -> Result<ActivityLease, HandoffError> {
+        activity::acquire_exclusive(
+            &self.paths.runtime_locks_dir(),
+            &self.paths.runtime_lock_path(name),
+            name,
+        )
     }
 
     fn register_session(
@@ -2297,6 +2395,90 @@ struct AuthInfo {
     email: String,
 }
 
+fn best_from_entries(entries: &[ProfileListEntry]) -> BestRecommendation {
+    let mut evaluations = Vec::with_capacity(entries.len());
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let (bucket, reason) = match (&entry.health, &entry.usage) {
+            (LocalHealth::Unhealthy(reason), _) => {
+                (None, format!("local profile is unhealthy: {reason}"))
+            }
+            (_, UsageStatus::Unavailable(reason)) => {
+                (None, format!("usage is unavailable: {reason}"))
+            }
+            (_, UsageStatus::NotQueried) => (None, "usage was not queried".into()),
+            (LocalHealth::Healthy, UsageStatus::Available(report)) => {
+                let bucket = report
+                    .buckets
+                    .iter()
+                    .find(|bucket| bucket.id == "codex")
+                    .or_else(|| report.buckets.iter().find(|bucket| bucket.id == "default"))
+                    .or_else(|| (report.buckets.len() == 1).then(|| &report.buckets[0]));
+                (bucket, "no recognizable primary quota bucket".into())
+            }
+        };
+        let Some(bucket) = bucket else {
+            evaluations.push(BestEvaluation {
+                profile: entry.name.clone(),
+                eligible: false,
+                reason,
+            });
+            continue;
+        };
+        if bucket.reached_type.is_some() {
+            evaluations.push(BestEvaluation {
+                profile: entry.name.clone(),
+                eligible: false,
+                reason: "quota limit has been reached".into(),
+            });
+            continue;
+        }
+        if bucket.spend_control_reached == Some(true) {
+            evaluations.push(BestEvaluation {
+                profile: entry.name.clone(),
+                eligible: false,
+                reason: "spend control has been reached".into(),
+            });
+            continue;
+        }
+        let Some(primary) = bucket.primary.as_ref() else {
+            evaluations.push(BestEvaluation {
+                profile: entry.name.clone(),
+                eligible: false,
+                reason: "primary quota window is unavailable".into(),
+            });
+            continue;
+        };
+        evaluations.push(BestEvaluation {
+            profile: entry.name.clone(),
+            eligible: true,
+            reason: format!("{} primary {}% used", bucket.id, primary.used_percent),
+        });
+        candidates.push((
+            entry.name.clone(),
+            primary.used_percent,
+            bucket
+                .secondary
+                .as_ref()
+                .map(|window| window.used_percent)
+                .unwrap_or(101),
+            primary.resets_at.unwrap_or(i64::MAX),
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        (left.1, left.2, left.3, left.0.as_str()).cmp(&(
+            right.1,
+            right.2,
+            right.3,
+            right.0.as_str(),
+        ))
+    });
+    BestRecommendation {
+        profile: candidates.first().map(|candidate| candidate.0.clone()),
+        evaluations,
+    }
+}
+
 fn parse_auth(bytes: &[u8]) -> Result<AuthInfo, HandoffError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| HandoffError::InvalidAuth(error.to_string()))?;
@@ -2345,9 +2527,9 @@ fn parse_auth(bytes: &[u8]) -> Result<AuthInfo, HandoffError> {
 mod tests {
     use super::{
         App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, ClientProcess,
-        CodexExecHiRunner, CodexRunner, HandoffError, HiRunner, LoginRunner, NoopProcessGuard,
-        ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader, UsageReport, UsageStatus,
-        UsageWindow, ensure_clients_stopped,
+        CodexExecHiRunner, CodexRunner, HandoffError, HiRunner, LocalHealth, LoginRunner,
+        NoopProcessGuard, ProcessGuard, ProfileListEntry, ProfileName, StaticProbe, UsageBucket,
+        UsageReader, UsageReport, UsageStatus, UsageWindow, ensure_clients_stopped,
     };
     use std::{
         fs,
@@ -2755,6 +2937,41 @@ mod tests {
     fn rejects_path_traversal_profile_names() {
         assert!(ProfileName::parse("../outside").is_err());
         assert!(ProfileName::parse("work/client").is_err());
+    }
+
+    #[test]
+    fn best_prefers_lowest_primary_then_secondary_usage() {
+        let entry = |name: &str, primary: u8, secondary: Option<u8>| ProfileListEntry {
+            name: ProfileName::parse(name).unwrap(),
+            metadata: None,
+            active: false,
+            health: LocalHealth::Healthy,
+            usage: UsageStatus::Available(UsageReport {
+                buckets: vec![UsageBucket {
+                    id: "codex".into(),
+                    primary: Some(UsageWindow {
+                        used_percent: primary,
+                        resets_at: Some(100),
+                        window_duration_mins: None,
+                    }),
+                    secondary: secondary.map(|used_percent| UsageWindow {
+                        used_percent,
+                        resets_at: None,
+                        window_duration_mins: None,
+                    }),
+                    reached_type: None,
+                    spend_control_reached: Some(false),
+                }],
+                reset_credits: None,
+            }),
+        };
+        let recommendation = super::best_from_entries(&[
+            entry("missing-secondary", 10, None),
+            entry("higher-primary", 11, Some(0)),
+            entry("winner", 10, Some(50)),
+        ]);
+
+        assert_eq!(recommendation.profile.unwrap().as_str(), "winner");
     }
 
     #[test]
@@ -3387,6 +3604,25 @@ done
         let refreshed = AppServerProbe::from_path(script).probe(&auth).unwrap();
 
         assert_eq!(refreshed, auth);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_compatibility_check_only_initializes_the_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("fake-codex");
+        fs::write(
+            &script,
+            "#!/bin/sh\nread initialize\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nread initialized\ncase \"$initialized\" in *initialized*) exit 0;; *) exit 9;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        AppServerProbe::from_path(script)
+            .check_compatibility()
+            .unwrap();
     }
 
     #[cfg(unix)]
