@@ -6,11 +6,11 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -129,6 +129,8 @@ pub enum HandoffError {
     ProfileBusy(String),
     #[error("profile `{0}` changed while authentication was being refreshed; retry the operation")]
     ProfileChanged(String),
+    #[error("concurrency must be between 1 and 16")]
+    InvalidConcurrency,
     #[error("authentication preflight failed: {0}")]
     Preflight(String),
     #[error("usage query failed: {0}")]
@@ -326,6 +328,14 @@ pub struct HiProfileResult {
     pub email: String,
     pub active: bool,
     pub reply: Result<String, String>,
+}
+
+#[derive(Clone)]
+struct InventoryEntry {
+    name: ProfileName,
+    metadata: Option<ProfileMetadata>,
+    active: bool,
+    health: LocalHealth,
 }
 
 pub trait AuthProbe: Send + Sync {
@@ -834,6 +844,15 @@ impl LoginRunner for NoopLoginRunner {
 
 pub trait HiRunner: Send + Sync {
     fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError>;
+
+    fn send_hi_with_timeout(
+        &self,
+        auth: &[u8],
+        prompt: &str,
+        _timeout: Duration,
+    ) -> Result<(String, Vec<u8>), HandoffError> {
+        self.send_hi(auth, prompt)
+    }
 }
 
 pub struct UnavailableHiRunner;
@@ -858,6 +877,15 @@ impl CodexExecHiRunner {
 
 impl HiRunner for CodexExecHiRunner {
     fn send_hi(&self, auth: &[u8], prompt: &str) -> Result<(String, Vec<u8>), HandoffError> {
+        self.send_hi_with_timeout(auth, prompt, Duration::from_secs(120))
+    }
+
+    fn send_hi_with_timeout(
+        &self,
+        auth: &[u8],
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<(String, Vec<u8>), HandoffError> {
         parse_auth(auth)?;
         let temporary = tempfile::tempdir()?;
         let auth_path = temporary.path().join("auth.json");
@@ -868,7 +896,9 @@ impl HiRunner for CodexExecHiRunner {
             fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
         }
 
-        let output = Command::new(&self.codex_binary)
+        let mut stdout_file = tempfile::tempfile()?;
+        let mut stderr_file = tempfile::tempfile()?;
+        let mut child = Command::new(&self.codex_binary)
             .args([
                 "exec",
                 "--ephemeral",
@@ -882,10 +912,31 @@ impl HiRunner for CodexExecHiRunner {
             .env("CODEX_HOME", temporary.path())
             .current_dir(temporary.path())
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdout(Stdio::from(stdout_file.try_clone()?))
+            .stderr(Stdio::from(stderr_file.try_clone()?))
+            .spawn()
             .map_err(|error| HandoffError::Hi(format!("could not start Codex exec: {error}")))?;
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HandoffError::Hi(format!(
+                    "Codex exec timed out after {} seconds",
+                    timeout.as_secs()
+                )));
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        stdout_file.rewind()?;
+        stderr_file.rewind()?;
+        stdout_file.read_to_end(&mut stdout)?;
+        stderr_file.read_to_end(&mut stderr)?;
 
         let updated_auth = fs::read(&auth_path).unwrap_or_else(|_| auth.to_vec());
         let updated_auth = if parse_auth(&updated_auth).is_ok() {
@@ -894,8 +945,8 @@ impl HiRunner for CodexExecHiRunner {
             auth.to_vec()
         };
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if status.success() {
+            let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
             let msg = if stdout.is_empty() {
                 "(empty response)".to_string()
             } else {
@@ -903,14 +954,14 @@ impl HiRunner for CodexExecHiRunner {
             };
             Ok((msg, updated_auth))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
             let details = if !stderr.is_empty() {
                 stderr
             } else if !stdout.is_empty() {
                 stdout
             } else {
-                format!("exit code {:?}", output.status.code())
+                format!("exit code {:?}", status.code())
             };
             Err(HandoffError::Hi(details))
         }
@@ -1172,10 +1223,74 @@ impl App {
     }
 
     pub fn list(&self) -> Result<Vec<ProfileListEntry>, HandoffError> {
-        self.list_with_usage(true)
+        self.list_with_concurrency(true, 4)
     }
 
     fn list_with_usage(&self, include_usage: bool) -> Result<Vec<ProfileListEntry>, HandoffError> {
+        self.list_with_concurrency(include_usage, 4)
+    }
+
+    pub fn list_offline(&self) -> Result<Vec<ProfileListEntry>, HandoffError> {
+        self.list_with_concurrency(false, 1)
+    }
+
+    pub fn list_with_concurrency(
+        &self,
+        include_usage: bool,
+        concurrency: usize,
+    ) -> Result<Vec<ProfileListEntry>, HandoffError> {
+        if !(1..=16).contains(&concurrency) {
+            return Err(HandoffError::InvalidConcurrency);
+        }
+        let inventory = self.profile_inventory()?;
+        if !include_usage {
+            return Ok(inventory
+                .into_iter()
+                .map(|entry| ProfileListEntry {
+                    name: entry.name,
+                    metadata: entry.metadata,
+                    active: entry.active,
+                    health: entry.health,
+                    usage: UsageStatus::NotQueried,
+                })
+                .collect());
+        }
+
+        let queue = std::sync::Mutex::new(inventory.into_iter());
+        let results = std::sync::Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            for _ in 0..concurrency {
+                scope.spawn(|| {
+                    loop {
+                        let Some(entry) = queue.lock().expect("inventory lock poisoned").next()
+                        else {
+                            break;
+                        };
+                        let usage = match (&entry.metadata, &entry.health) {
+                            (Some(metadata), LocalHealth::Healthy) => {
+                                self.profile_usage(&entry.name, metadata, entry.active)
+                            }
+                            _ => UsageStatus::Unavailable("local profile is unhealthy".into()),
+                        };
+                        results.lock().expect("profile result lock poisoned").push(
+                            ProfileListEntry {
+                                name: entry.name,
+                                metadata: entry.metadata,
+                                active: entry.active,
+                                health: entry.health,
+                                usage,
+                            },
+                        );
+                    }
+                });
+            }
+        });
+        let mut profiles = results.into_inner().expect("profile result lock poisoned");
+        profiles.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+        Ok(profiles)
+    }
+
+    fn profile_inventory(&self) -> Result<Vec<InventoryEntry>, HandoffError> {
         let active = self.load_state().ok().map(|state| state.active_profile);
         let mut profiles = Vec::new();
         if !self.paths.profiles_dir().exists() {
@@ -1204,22 +1319,11 @@ impl App {
                 },
                 Err(error) => (None, LocalHealth::Unhealthy(error.to_string())),
             };
-            let usage = if include_usage {
-                match (&metadata, &health) {
-                    (Some(metadata), LocalHealth::Healthy) => {
-                        self.profile_usage(&name, metadata, is_active)
-                    }
-                    _ => UsageStatus::Unavailable("local profile is unhealthy".into()),
-                }
-            } else {
-                UsageStatus::NotQueried
-            };
-            profiles.push(ProfileListEntry {
+            profiles.push(InventoryEntry {
                 name,
                 metadata,
                 active: is_active,
                 health,
-                usage,
             });
         }
         profiles.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
@@ -1227,120 +1331,149 @@ impl App {
     }
 
     pub fn hi(&self, prompt: &str) -> Result<Vec<HiProfileResult>, HandoffError> {
-        let active = self.load_state().ok().map(|state| state.active_profile);
-        let mut results = Vec::new();
-        if !self.paths.profiles_dir().exists() {
-            return Ok(results);
+        self.hi_with_concurrency(prompt, 4)
+    }
+
+    pub fn hi_with_concurrency(
+        &self,
+        prompt: &str,
+        concurrency: usize,
+    ) -> Result<Vec<HiProfileResult>, HandoffError> {
+        self.hi_with_options(prompt, concurrency, Duration::from_secs(120))
+    }
+
+    pub fn hi_with_options(
+        &self,
+        prompt: &str,
+        concurrency: usize,
+        timeout: Duration,
+    ) -> Result<Vec<HiProfileResult>, HandoffError> {
+        if !(1..=16).contains(&concurrency) {
+            return Err(HandoffError::InvalidConcurrency);
         }
-        for entry in fs::read_dir(self.paths.profiles_dir())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(name) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| ProfileName::parse(name).ok())
-            else {
-                continue;
-            };
-            let is_active = active.as_ref() == Some(&name);
-            let (metadata, health) = match self.load_profile(&name) {
-                Ok(metadata) => match self.read_profile_auth(&name) {
-                    Ok(auth) => match self.ensure_profile_email(&metadata, &auth) {
-                        Ok(()) => (Some(metadata), LocalHealth::Healthy),
-                        Err(error) => (Some(metadata), LocalHealth::Unhealthy(error.to_string())),
-                    },
-                    Err(error) => (Some(metadata), LocalHealth::Unhealthy(error.to_string())),
-                },
-                Err(error) => (None, LocalHealth::Unhealthy(error.to_string())),
-            };
-
-            let email = metadata
-                .as_ref()
-                .map(|meta| meta.email.clone())
-                .unwrap_or_else(|| "<unknown>".to_string());
-
-            let reply = match (&metadata, &health) {
-                (Some(metadata), LocalHealth::Healthy) => {
-                    if is_active && self.default_clients_are_running(&name)? {
-                        results.push(HiProfileResult {
-                            name,
-                            email,
-                            active: is_active,
-                            reply: Err(
-                                "active Codex or ChatGPT client is running; prompt was not sent"
-                                    .into(),
-                            ),
-                        });
-                        continue;
+        let queue = std::sync::Mutex::new(self.profile_inventory()?.into_iter());
+        let results = std::sync::Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            for _ in 0..concurrency {
+                scope.spawn(|| {
+                    loop {
+                        let Some(entry) = queue.lock().expect("inventory lock poisoned").next()
+                        else {
+                            break;
+                        };
+                        results
+                            .lock()
+                            .expect("hi result lock poisoned")
+                            .push(self.hi_profile(entry, prompt, timeout));
                     }
-                    let runtime_lock = if is_active {
-                        None
-                    } else {
-                        match self.acquire_runtime_lock_exclusive(&name) {
-                            Ok(lock) => Some(lock),
-                            Err(HandoffError::ProfileBusy(_)) => {
-                                results.push(HiProfileResult {
-                                    name,
-                                    email,
-                                    active: is_active,
-                                    reply: Err(
-                                        "profile is currently in use; prompt was not sent".into()
-                                    ),
-                                });
-                                continue;
-                            }
-                            Err(error) => {
-                                results.push(HiProfileResult {
-                                    name,
-                                    email,
-                                    active: is_active,
-                                    reply: Err(error.to_string()),
-                                });
-                                continue;
-                            }
+                });
+            }
+        });
+        let mut results = results.into_inner().expect("hi result lock poisoned");
+        results.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+        Ok(results)
+    }
+
+    fn hi_profile(
+        &self,
+        entry: InventoryEntry,
+        prompt: &str,
+        timeout: Duration,
+    ) -> HiProfileResult {
+        let InventoryEntry {
+            name,
+            metadata,
+            active: is_active,
+            health,
+        } = entry;
+        let email = metadata
+            .as_ref()
+            .map(|meta| meta.email.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        let reply = match (&metadata, &health) {
+            (Some(metadata), LocalHealth::Healthy) => {
+                if is_active {
+                    match self.default_clients_are_running(&name) {
+                        Ok(true) => {
+                            return HiProfileResult {
+                                name,
+                                email,
+                                active: is_active,
+                                reply: Err(
+                                    "active Codex or ChatGPT client is running; prompt was not sent"
+                                        .into(),
+                                ),
+                            };
                         }
-                    };
-                    let auth = if is_active {
-                        self.read_live_auth()
-                    } else {
-                        self.read_profile_auth(&name)
-                    };
-                    let reply = match auth {
-                        Ok(auth) => match self.ensure_profile_email(metadata, &auth) {
-                            Ok(()) => match self.hi_runner.send_hi(&auth, prompt) {
-                                Ok((msg, updated_auth)) => self
-                                    .persist_refreshed_auth(
-                                        metadata,
-                                        &auth,
-                                        &updated_auth,
-                                        is_active,
-                                    )
-                                    .map(|()| msg)
-                                    .map_err(|error| error.to_string()),
-                                Err(error) => Err(error.to_string()),
-                            },
+                        Err(error) => {
+                            return HiProfileResult {
+                                name,
+                                email,
+                                active: is_active,
+                                reply: Err(error.to_string()),
+                            };
+                        }
+                        Ok(false) => {}
+                    }
+                }
+                let runtime_lock = if is_active {
+                    None
+                } else {
+                    match self.acquire_runtime_lock_exclusive(&name) {
+                        Ok(lock) => Some(lock),
+                        Err(HandoffError::ProfileBusy(_)) => {
+                            return HiProfileResult {
+                                name,
+                                email,
+                                active: is_active,
+                                reply: Err(
+                                    "profile is currently in use; prompt was not sent".into()
+                                ),
+                            };
+                        }
+                        Err(error) => {
+                            return HiProfileResult {
+                                name,
+                                email,
+                                active: is_active,
+                                reply: Err(error.to_string()),
+                            };
+                        }
+                    }
+                };
+                let auth = if is_active {
+                    self.read_live_auth()
+                } else {
+                    self.read_profile_auth(&name)
+                };
+                let reply = match auth {
+                    Ok(auth) => match self.ensure_profile_email(metadata, &auth) {
+                        Ok(()) => match self.hi_runner.send_hi_with_timeout(&auth, prompt, timeout)
+                        {
+                            Ok((msg, updated_auth)) => self
+                                .persist_refreshed_auth(metadata, &auth, &updated_auth, is_active)
+                                .map(|()| msg)
+                                .map_err(|error| error.to_string()),
                             Err(error) => Err(error.to_string()),
                         },
                         Err(error) => Err(error.to_string()),
-                    };
-                    drop(runtime_lock);
-                    reply
-                }
-                (_, LocalHealth::Unhealthy(reason)) => Err(format!("unhealthy profile: {reason}")),
-                _ => Err("profile is unavailable".into()),
-            };
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                drop(runtime_lock);
+                reply
+            }
+            (_, LocalHealth::Unhealthy(reason)) => Err(format!("unhealthy profile: {reason}")),
+            _ => Err("profile is unavailable".into()),
+        };
 
-            results.push(HiProfileResult {
-                name,
-                email,
-                active: is_active,
-                reply,
-            });
+        HiProfileResult {
+            name,
+            email,
+            active: is_active,
+            reply,
         }
-        results.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        Ok(results)
     }
 
     pub fn sync(&self, force: bool) -> Result<(), HandoffError> {
@@ -1435,8 +1568,80 @@ impl App {
         self.login_profile(None, force, false)
     }
 
+    pub fn add_named(&self, name: ProfileName, force: bool) -> Result<ProfileName, HandoffError> {
+        self.login_profile(Some(name), force, false)
+    }
+
     pub fn relogin(&self, name: ProfileName, force: bool) -> Result<(), HandoffError> {
         self.login_profile(Some(name), force, true).map(|_| ())
+    }
+
+    pub fn rename_profile(
+        &self,
+        current: &ProfileName,
+        new_name: ProfileName,
+    ) -> Result<(), HandoffError> {
+        let _lock = self.lock()?;
+        if current == &new_name {
+            self.load_profile(current)?;
+            return Ok(());
+        }
+        if self.paths.profile_dir(&new_name).exists() {
+            return Err(HandoffError::ProfileExists(new_name.as_str().into()));
+        }
+        let state = self.load_state()?;
+        if state.active_profile == *current && self.default_clients_are_running(current)? {
+            return Err(HandoffError::ProfileBusy(current.as_str().into()));
+        }
+        let _runtime_lease = self.acquire_runtime_lock_exclusive(current)?;
+        let mut profile = self.load_profile(current)?;
+        let original_metadata = fs::read(self.paths.profile_metadata_path(current))?;
+        let original_state = fs::read(self.paths.state_path())?;
+        let old_directory = self.paths.profile_dir(current);
+        let new_directory = self.paths.profile_dir(&new_name);
+        fs::rename(&old_directory, &new_directory)?;
+        profile.name = new_name.clone();
+        let updated_state = State {
+            schema_version: SCHEMA_VERSION,
+            active_profile: if state.active_profile == *current {
+                new_name.clone()
+            } else {
+                state.active_profile
+            },
+        };
+        let result = self
+            .save_metadata(&profile)
+            .and_then(|()| self.save_state(&updated_state));
+        if let Err(operation_error) = result {
+            let rollback = (|| {
+                fs::rename(&new_directory, &old_directory)?;
+                self.atomic_write(
+                    &self.paths.profile_metadata_path(current),
+                    &original_metadata,
+                )?;
+                self.atomic_write(&self.paths.state_path(), &original_state)
+            })();
+            return match rollback {
+                Ok(()) => Err(operation_error),
+                Err(rollback_error) => Err(HandoffError::Rollback {
+                    operation: operation_error.to_string(),
+                    rollback: rollback_error.to_string(),
+                }),
+            };
+        }
+        Ok(())
+    }
+
+    pub fn remove_profile(&self, name: &ProfileName) -> Result<(), HandoffError> {
+        let _lock = self.lock()?;
+        let state = self.load_state()?;
+        if state.active_profile == *name {
+            return Err(HandoffError::ProfileBusy(name.as_str().into()));
+        }
+        let _runtime_lease = self.acquire_runtime_lock_exclusive(name)?;
+        self.load_profile(name)?;
+        fs::remove_dir_all(self.paths.profile_dir(name))?;
+        Ok(())
     }
 
     fn login_profile(
@@ -2553,6 +2758,54 @@ mod tests {
     }
 
     #[test]
+    fn rename_profile_updates_metadata_and_preserves_authentication() {
+        let (_temporary, app) = app();
+        let original_auth = auth("personal@example.com", 1);
+        write_live_auth(&app, &original_auth);
+        app.init().unwrap();
+        let original = ProfileName::parse("personal").unwrap();
+        let renamed = ProfileName::parse("home").unwrap();
+
+        app.rename_profile(&original, renamed.clone()).unwrap();
+
+        assert_eq!(app.status().unwrap().active.name, renamed);
+        assert_eq!(
+            fs::read(app.paths().profile_auth_path(&renamed)).unwrap(),
+            original_auth
+        );
+        assert!(!app.paths().profile_dir(&original).exists());
+    }
+
+    #[test]
+    fn remove_profile_rejects_active_and_busy_profiles() {
+        let (_temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let active = ProfileName::parse("personal").unwrap();
+        assert!(matches!(
+            app.remove_profile(&active),
+            Err(HandoffError::ProfileBusy(name)) if name == "personal"
+        ));
+
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        app.save_profile(
+            &app.new_metadata(work.clone(), &work_auth).unwrap(),
+            &work_auth,
+        )
+        .unwrap();
+        let lease = app.acquire_runtime_lock_shared(&work).unwrap();
+        assert!(matches!(
+            app.remove_profile(&work),
+            Err(HandoffError::ProfileBusy(name)) if name == "work"
+        ));
+        drop(lease);
+
+        app.remove_profile(&work).unwrap();
+        assert!(!app.paths().profile_dir(&work).exists());
+    }
+
+    #[test]
     fn client_process_lookup_failures_are_reported_unless_forced() {
         let error = ensure_clients_stopped(false, || {
             Err(HandoffError::ClientCheckFailed("pgrep unavailable".into()))
@@ -3346,6 +3599,27 @@ exit 1
         let (reply, _updated_auth) = runner.send_hi(&auth("work@example.com", 1), "hi").unwrap();
 
         assert_eq!(reply, "hello from model");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_exec_hi_runner_enforces_its_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("slow-codex");
+        fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = CodexExecHiRunner::from_path(script)
+            .send_hi_with_timeout(
+                &auth("slow@example.com", 1),
+                "hi",
+                std::time::Duration::from_millis(10),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
