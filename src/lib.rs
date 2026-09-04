@@ -208,7 +208,8 @@ impl AppPaths {
         self.handoff_home.join("runtime-locks")
     }
     fn runtime_lock_path(&self, name: &ProfileName) -> PathBuf {
-        self.runtime_locks_dir().join(format!("{}.lock", name.as_str()))
+        self.runtime_locks_dir()
+            .join(format!("{}.lock", name.as_str()))
     }
     fn session_path(&self, pid: u32) -> PathBuf {
         self.sessions_dir().join(format!("{pid}.json"))
@@ -479,7 +480,6 @@ impl ProcessGuard for SystemProcessGuard {
             ))
         }
     }
-
 }
 
 impl SystemProcessGuard {
@@ -803,11 +803,10 @@ impl UsageReader for AppServerUsageReader {
                     &response,
                 ));
             }
-            let report = parse_usage_report(
-                response
-                    .get("result")
-                    .ok_or_else(|| HandoffError::Usage("Codex returned no usage result".into()))?,
-            )?;
+            let report =
+                parse_usage_report(response.get("result").ok_or_else(|| {
+                    HandoffError::Usage("Codex returned no usage result".into())
+                })?)?;
             let updated_auth = fs::read(&auth_path)?;
             parse_auth(&updated_auth)?;
             Ok((report, updated_auth))
@@ -1049,9 +1048,7 @@ impl HiRunner for CodexExecHiRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|error| {
-                HandoffError::Hi(format!("could not start Codex exec: {error}"))
-            })?;
+            .map_err(|error| HandoffError::Hi(format!("could not start Codex exec: {error}")))?;
 
         let updated_auth = fs::read(&auth_path).unwrap_or_else(|_| auth.to_vec());
         let updated_auth = if parse_auth(&updated_auth).is_ok() {
@@ -1305,9 +1302,7 @@ impl App {
                     Some(self.acquire_runtime_lock_shared(name)?),
                 )
             };
-            let mut child = self
-                .codex_runner
-                .spawn(&codex_home, args)?;
+            let mut child = self.codex_runner.spawn(&codex_home, args)?;
             if let Err(error) = self.register_session(name, child.id(), is_active) {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1454,7 +1449,7 @@ impl App {
                                     email,
                                     active: is_active,
                                     reply: Err(
-                                        "profile is currently in use; prompt was not sent".into(),
+                                        "profile is currently in use; prompt was not sent".into()
                                     ),
                                 });
                                 continue;
@@ -1548,7 +1543,8 @@ impl App {
         let state = self.load_state()?;
         let mut client_scope = self.switch_client_scope(&name)?;
         if close_clients && !client_scope.default_clients.is_empty() {
-            self.process_guard.close_clients(&client_scope.default_clients)?;
+            self.process_guard
+                .close_clients(&client_scope.default_clients)?;
             client_scope = self.switch_client_scope(&name)?;
         }
         if !client_scope.default_clients.is_empty() {
@@ -2033,8 +2029,7 @@ impl App {
             match self.default_clients_are_running(name) {
                 Ok(true) => {
                     return UsageStatus::Unavailable(
-                        "active Codex or ChatGPT client is running; usage was not refreshed"
-                            .into(),
+                        "active Codex or ChatGPT client is running; usage was not refreshed".into(),
                     );
                 }
                 Err(error) => return UsageStatus::Unavailable(error.to_string()),
@@ -2307,11 +2302,10 @@ fn parse_auth(bytes: &[u8]) -> Result<AuthInfo, HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, CodexExecHiRunner,
-        ClientProcess, CodexRunner, HandoffError, HiRunner, LoginRunner, NoopProcessGuard,
-        ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader, UsageReport,
-        UsageStatus, UsageWindow,
-        ensure_clients_stopped,
+        App, AppPaths, AppServerProbe, AppServerUsageReader, AuthProbe, ClientProcess,
+        CodexExecHiRunner, CodexRunner, HandoffError, HiRunner, LoginRunner, NoopProcessGuard,
+        ProcessGuard, ProfileName, StaticProbe, UsageBucket, UsageReader, UsageReport, UsageStatus,
+        UsageWindow, ensure_clients_stopped,
     };
     use std::{
         fs,
@@ -2324,9 +2318,11 @@ mod tests {
 
     struct FakeLogin(Vec<u8>);
 
+    type CodexRunCall = (std::path::PathBuf, Vec<std::ffi::OsString>);
+
     #[derive(Clone)]
     struct RecordingCodexRunner {
-        calls: Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Vec<std::ffi::OsString>)>>>,
+        calls: Arc<std::sync::Mutex<Vec<CodexRunCall>>>,
     }
 
     impl RecordingCodexRunner {
@@ -2887,12 +2883,18 @@ mod tests {
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
-        app.save_profile(&app.new_metadata(work.clone(), &work_auth).unwrap(), &work_auth)
-            .unwrap();
+        app.save_profile(
+            &app.new_metadata(work.clone(), &work_auth).unwrap(),
+            &work_auth,
+        )
+        .unwrap();
         let other = ProfileName::parse("other").unwrap();
         let other_auth = auth("other@example.com", 1);
-        app.save_profile(&app.new_metadata(other.clone(), &other_auth).unwrap(), &other_auth)
-            .unwrap();
+        app.save_profile(
+            &app.new_metadata(other.clone(), &other_auth).unwrap(),
+            &other_auth,
+        )
+        .unwrap();
 
         let target_lease = app.acquire_runtime_lock_shared(&work).unwrap();
         assert!(matches!(
@@ -3393,13 +3395,22 @@ done
         let results = app.hi("hi").unwrap();
 
         assert_eq!(results.len(), 2);
-        let personal = results.iter().find(|r| r.name.as_str() == "personal").unwrap();
+        let personal = results
+            .iter()
+            .find(|r| r.name.as_str() == "personal")
+            .unwrap();
         assert!(personal.active);
-        assert_eq!(personal.reply.as_deref(), Ok("reply to hi for personal@example.com"));
+        assert_eq!(
+            personal.reply.as_deref(),
+            Ok("reply to hi for personal@example.com")
+        );
 
         let work_res = results.iter().find(|r| r.name.as_str() == "work").unwrap();
         assert!(!work_res.active);
-        assert_eq!(work_res.reply.as_deref(), Ok("reply to hi for work@example.com"));
+        assert_eq!(
+            work_res.reply.as_deref(),
+            Ok("reply to hi for work@example.com")
+        );
     }
 
     #[test]
@@ -3414,7 +3425,9 @@ done
             Box::new(StaticProbe::success()),
             Box::new(NoopProcessGuard),
         )
-        .with_hi_runner(Box::new(FakeHiRunner::with_failing_email("work@example.com")));
+        .with_hi_runner(Box::new(FakeHiRunner::with_failing_email(
+            "work@example.com",
+        )));
 
         write_live_auth(&app, &auth("personal@example.com", 1));
         app.init().unwrap();
@@ -3426,7 +3439,10 @@ done
         let results = app.hi("hi").unwrap();
 
         assert_eq!(results.len(), 2);
-        let personal = results.iter().find(|r| r.name.as_str() == "personal").unwrap();
+        let personal = results
+            .iter()
+            .find(|r| r.name.as_str() == "personal")
+            .unwrap();
         assert!(personal.reply.is_ok());
 
         let work_res = results.iter().find(|r| r.name.as_str() == "work").unwrap();
@@ -3461,7 +3477,10 @@ done
         }
 
         let results = app.hi("hi").unwrap();
-        let broken_res = results.iter().find(|r| r.name.as_str() == "broken").unwrap();
+        let broken_res = results
+            .iter()
+            .find(|r| r.name.as_str() == "broken")
+            .unwrap();
         assert!(broken_res.reply.is_err());
     }
 
@@ -3554,8 +3573,11 @@ exit 1
         app.init().unwrap();
         let work = ProfileName::parse("work").unwrap();
         let work_auth = auth("work@example.com", 1);
-        app.save_profile(&app.new_metadata(work.clone(), &work_auth).unwrap(), &work_auth)
-            .unwrap();
+        app.save_profile(
+            &app.new_metadata(work.clone(), &work_auth).unwrap(),
+            &work_auth,
+        )
+        .unwrap();
 
         let runtime_lease = app.acquire_runtime_lock_shared(&work).unwrap();
         let work_entry = app
@@ -3566,7 +3588,9 @@ exit 1
             .unwrap();
         drop(runtime_lease);
 
-        assert!(matches!(work_entry.usage, UsageStatus::Unavailable(message) if message.contains("currently in use")));
+        assert!(
+            matches!(work_entry.usage, UsageStatus::Unavailable(message) if message.contains("currently in use"))
+        );
         assert_eq!(app.read_profile_auth(&work).unwrap(), work_auth);
     }
 
@@ -3579,16 +3603,12 @@ exit 1
         );
         let guard = CloseableProcessGuard::new();
         let usage_queried = Arc::new(AtomicBool::new(false));
-        let app = App::with_components(
-            paths,
-            Box::new(StaticProbe::success()),
-            Box::new(guard),
-        )
-        .with_usage_reader(Box::new(CountingUsageReader(usage_queried.clone())))
-        .with_hi_runner(Box::new(FakeHiRunner::with_refreshed_auth(auth(
-            "personal@example.com",
-            2,
-        ))));
+        let app = App::with_components(paths, Box::new(StaticProbe::success()), Box::new(guard))
+            .with_usage_reader(Box::new(CountingUsageReader(usage_queried.clone())))
+            .with_hi_runner(Box::new(FakeHiRunner::with_refreshed_auth(auth(
+                "personal@example.com",
+                2,
+            ))));
         let original_auth = auth("personal@example.com", 1);
         write_live_auth(&app, &original_auth);
         app.init().unwrap();
