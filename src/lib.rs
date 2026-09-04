@@ -934,6 +934,9 @@ impl HiRunner for CodexExecHiRunner {
         timeout: Duration,
     ) -> Result<(String, Vec<u8>), HandoffError> {
         parse_auth(auth)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| HandoffError::Hi("timeout is too large".into()))?;
         let temporary = tempfile::tempdir()?;
         let auth_path = temporary.path().join("auth.json");
         fs::write(&auth_path, auth)?;
@@ -944,7 +947,7 @@ impl HiRunner for CodexExecHiRunner {
         }
 
         let mut stdout_file = tempfile::tempfile()?;
-        let mut stderr_file = tempfile::tempfile()?;
+        let stderr_file = tempfile::tempfile()?;
         let mut child = Command::new(&self.codex_binary)
             .args([
                 "exec",
@@ -963,7 +966,6 @@ impl HiRunner for CodexExecHiRunner {
             .stderr(Stdio::from(stderr_file.try_clone()?))
             .spawn()
             .map_err(|error| HandoffError::Hi(format!("could not start Codex exec: {error}")))?;
-        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -979,11 +981,8 @@ impl HiRunner for CodexExecHiRunner {
             thread::sleep(Duration::from_millis(25));
         };
         let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
         stdout_file.rewind()?;
-        stderr_file.rewind()?;
         stdout_file.read_to_end(&mut stdout)?;
-        stderr_file.read_to_end(&mut stderr)?;
 
         let updated_auth = fs::read(&auth_path).unwrap_or_else(|_| auth.to_vec());
         let updated_auth = if parse_auth(&updated_auth).is_ok() {
@@ -1001,16 +1000,10 @@ impl HiRunner for CodexExecHiRunner {
             };
             Ok((msg, updated_auth))
         } else {
-            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
-            let details = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit code {:?}", status.code())
-            };
-            Err(HandoffError::Hi(details))
+            Err(HandoffError::Hi(format!(
+                "Codex exec exited unsuccessfully (code {:?})",
+                status.code()
+            )))
         }
     }
 }
@@ -2347,10 +2340,16 @@ fn private_file(file: &File) -> Result<(), HandoffError> {
 }
 
 fn ensure_private_file_path(path: &Path) -> Result<(), HandoffError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(HandoffError::InsecurePermissions(
+            path.display().to_string(),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path)?.permissions().mode();
+        let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(HandoffError::InsecurePermissions(
                 path.display().to_string(),
@@ -2361,10 +2360,16 @@ fn ensure_private_file_path(path: &Path) -> Result<(), HandoffError> {
 }
 
 fn ensure_private_dir_path(path: &Path) -> Result<(), HandoffError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(HandoffError::InsecurePermissions(
+            path.display().to_string(),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path)?.permissions().mode();
+        let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(HandoffError::InsecurePermissions(
                 path.display().to_string(),
@@ -2375,15 +2380,19 @@ fn ensure_private_dir_path(path: &Path) -> Result<(), HandoffError> {
 }
 
 fn private_path_is_safe(path: &Path, directory: bool) -> bool {
-    if directory != path.is_dir() {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink()
+        || directory != metadata.file_type().is_dir()
+        || directory == metadata.file_type().is_file()
+    {
         return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o077 == 0)
-            .unwrap_or(false)
+        metadata.permissions().mode() & 0o077 == 0
     }
     #[cfg(not(unix))]
     {
@@ -2536,7 +2545,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -2664,6 +2673,11 @@ mod tests {
     #[derive(Clone)]
     struct CountingUsageReader(Arc<AtomicBool>);
 
+    struct ConcurrentUsageReader {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
     impl UsageReader for FakeUsageReader {
         fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
             let email = super::parse_auth(auth)?.email;
@@ -2688,6 +2702,16 @@ mod tests {
                 },
                 updated,
             ))
+        }
+    }
+
+    impl UsageReader for ConcurrentUsageReader {
+        fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            FakeUsageReader::new().read(auth)
         }
     }
 
@@ -3023,6 +3047,31 @@ mod tests {
     }
 
     #[test]
+    fn rename_profile_rejects_busy_and_existing_targets() {
+        let (_temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let work = ProfileName::parse("work").unwrap();
+        let work_auth = auth("work@example.com", 1);
+        app.save_profile(
+            &app.new_metadata(work.clone(), &work_auth).unwrap(),
+            &work_auth,
+        )
+        .unwrap();
+        let lease = app.acquire_runtime_lock_shared(&work).unwrap();
+        assert!(matches!(
+            app.rename_profile(&work, ProfileName::parse("office").unwrap()),
+            Err(HandoffError::ProfileBusy(name)) if name == "work"
+        ));
+        drop(lease);
+
+        assert!(matches!(
+            app.rename_profile(&work, ProfileName::parse("personal").unwrap()),
+            Err(HandoffError::ProfileExists(name)) if name == "personal"
+        ));
+    }
+
+    #[test]
     fn client_process_lookup_failures_are_reported_unless_forced() {
         let error = ensure_clients_stopped(false, || {
             Err(HandoffError::ClientCheckFailed("pgrep unavailable".into()))
@@ -3248,6 +3297,32 @@ mod tests {
             .find(|profile| profile.name.as_str() == "work")
             .unwrap();
         assert!(matches!(work.usage, UsageStatus::Unavailable(_)));
+    }
+
+    #[test]
+    fn list_respects_the_configured_concurrency_limit() {
+        let (temporary, base_app) = app();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let app = base_app.with_usage_reader(Box::new(ConcurrentUsageReader {
+            active: active.clone(),
+            maximum: maximum.clone(),
+        }));
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        for index in 0..5 {
+            let name = ProfileName::parse(format!("profile-{index}")).unwrap();
+            let bytes = auth(&format!("profile-{index}@example.com"), 1);
+            app.save_profile(&app.new_metadata(name, &bytes).unwrap(), &bytes)
+                .unwrap();
+        }
+
+        let entries = app.list_with_concurrency(true, 3).unwrap();
+
+        assert_eq!(entries.len(), 6);
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= 3);
+        drop(temporary);
     }
 
     #[test]
@@ -3489,6 +3564,27 @@ mod tests {
         assert!(matches!(
             app.switch(work, false),
             Err(super::HandoffError::InsecurePermissions(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_authentication_symlinks_are_rejected() {
+        use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+        let (temporary, app) = app();
+        write_live_auth(&app, &auth("personal@example.com", 1));
+        app.init().unwrap();
+        let personal = ProfileName::parse("personal").unwrap();
+        let external = temporary.path().join("external-auth.json");
+        fs::write(&external, auth("personal@example.com", 1)).unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(app.paths().profile_auth_path(&personal)).unwrap();
+        symlink(&external, app.paths().profile_auth_path(&personal)).unwrap();
+
+        assert!(matches!(
+            app.read_profile_auth(&personal),
+            Err(HandoffError::InsecurePermissions(_))
         ));
     }
 
@@ -3856,6 +3952,11 @@ exit 1
             .unwrap_err();
 
         assert!(error.to_string().contains("timed out"));
+
+        let error = CodexExecHiRunner::from_path("unused")
+            .send_hi_with_timeout(&auth("slow@example.com", 1), "hi", std::time::Duration::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("too large"));
     }
 
     #[test]

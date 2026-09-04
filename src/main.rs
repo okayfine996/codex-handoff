@@ -191,7 +191,13 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => {
             let entries = app.list_with_concurrency(!offline, usize::from(concurrency))?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "profiles": entries,
+                    }))?
+                );
                 return Ok(ExitCode::SUCCESS);
             }
             let output = presentation::render_list(&entries);
@@ -208,6 +214,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
                         "active": status.active,
                         "usage": usage,
                         "live_auth_path": app.paths().live_auth_path(),
@@ -232,7 +239,13 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .iter()
                 .any(|check| check.status == codex_handoff::DoctorStatus::Fail);
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&checks)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "checks": checks,
+                    }))?
+                );
             } else {
                 for check in &checks {
                     println!("{}: {}", check.label, check.message);
@@ -247,7 +260,13 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Best { concurrency } => {
             let recommendation = app.best(usize::from(concurrency))?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&recommendation)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "recommendation": recommendation,
+                    }))?
+                );
             } else if let Some(profile) = &recommendation.profile {
                 println!("{}", profile.as_str());
             } else {

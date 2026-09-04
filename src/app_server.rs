@@ -56,6 +56,9 @@ impl AppServerSession {
         operation: Operation,
         timeout: Duration,
     ) -> Result<Self, HandoffError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| operation.error("app-server timeout is too large"))?;
         let home = tempfile::tempdir()?;
         let auth_path = home.path().join("auth.json");
         fs::write(&auth_path, auth)?;
@@ -75,14 +78,22 @@ impl AppServerSession {
             .map_err(|error| {
                 operation.error(format!("could not start Codex app-server: {error}"))
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| operation.error("could not open app-server stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| operation.error("could not open app-server stdout"))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(operation.error("could not open app-server stdin"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(operation.error("could not open app-server stdout"));
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -101,7 +112,7 @@ impl AppServerSession {
             child,
             stdin,
             receiver,
-            deadline: Instant::now() + timeout,
+            deadline,
             operation,
         })
     }
