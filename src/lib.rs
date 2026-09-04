@@ -6,14 +6,17 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::mpsc,
     thread,
     time::Duration,
 };
 use thiserror::Error;
+
+mod app_server;
+
+use app_server::{AppServerSession, Operation as AppServerOperation};
 
 const SCHEMA_VERSION: u8 = 1;
 
@@ -555,124 +558,41 @@ impl AppServerProbe {
 
 impl AuthProbe for AppServerProbe {
     fn probe(&self, auth: &[u8]) -> Result<Vec<u8>, HandoffError> {
-        let temporary = tempfile::tempdir()?;
-        let auth_path = temporary.path().join("auth.json");
-        fs::write(&auth_path, auth)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        parse_auth(auth)?;
+        let mut session = AppServerSession::start(
+            &self.codex_binary,
+            auth,
+            AppServerOperation::Preflight,
+            Duration::from_secs(45),
+        )?;
+        session.initialize()?;
+        let message = session.request(
+            2,
+            serde_json::json!({
+                "method":"account/read",
+                "id":2,
+                "params":{"refreshToken":true}
+            }),
+        )?;
+        if message.get("error").is_some() {
+            return Err(HandoffError::Preflight(
+                "Codex rejected the authentication refresh".into(),
+            ));
         }
-        let mut child = Command::new(&self.codex_binary)
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", temporary.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                HandoffError::Preflight(format!("could not start Codex app-server: {error}"))
+        let account = message
+            .pointer("/result/account")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                HandoffError::Preflight("Codex reported no authenticated ChatGPT account".into())
             })?;
-        let verified = (|| {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| HandoffError::Preflight("could not open app-server stdin".into()))?;
-            let stdout = child.stdout.take().ok_or_else(|| {
-                HandoffError::Preflight("could not open app-server stdout".into())
-            })?;
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    let response = line.map_err(HandoffError::Io).and_then(|line| {
-                        serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
-                            HandoffError::Preflight(format!("invalid app-server response: {error}"))
-                        })
-                    });
-                    if sender.send(response).is_err() {
-                        break;
-                    }
-                }
-            });
-            let receive = |expected_id| loop {
-                match receiver.recv_timeout(Duration::from_secs(45)) {
-                    Ok(Ok(message))
-                        if message.get("id").and_then(serde_json::Value::as_i64)
-                            == Some(expected_id) =>
-                    {
-                        break Ok(message);
-                    }
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(error)) => break Err(error),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        break Err(HandoffError::Preflight(
-                            "Codex app-server timed out while verifying authentication".into(),
-                        ));
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        break Err(HandoffError::Preflight(
-                            "Codex app-server ended before authentication was verified".into(),
-                        ));
-                    }
-                }
-            };
-
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({
-                    "method":"initialize",
-                    "id":1,
-                    "params":{"clientInfo":{"name":"codex-handoff","title":"Codex Handoff","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}
-                })
-            )?;
-            let initialized = receive(1)?;
-            if initialized.get("error").is_some() {
-                return Err(HandoffError::Preflight(
-                    "Codex app-server rejected initialization".into(),
-                ));
-            }
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({"method":"initialized","params":{}})
-            )?;
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({
-                    "method":"account/read",
-                    "id":2,
-                    "params":{"refreshToken":true}
-                })
-            )?;
-
-            let message = receive(2)?;
-            if message.get("error").is_some() {
-                return Err(HandoffError::Preflight(
-                    "Codex rejected the authentication refresh".into(),
-                ));
-            }
-            let account = message
-                .pointer("/result/account")
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| {
-                    HandoffError::Preflight(
-                        "Codex reported no authenticated ChatGPT account".into(),
-                    )
-                })?;
-            if account.get("type").and_then(serde_json::Value::as_str) != Some("chatgpt") {
-                return Err(HandoffError::Preflight(
-                    "Codex did not verify ChatGPT authentication".into(),
-                ));
-            }
-            let updated_auth = fs::read(auth_path)?;
-            parse_auth(&updated_auth)?;
-            Ok(updated_auth)
-        })();
-        let _ = child.kill();
-        let _ = child.wait();
-        verified
+        if account.get("type").and_then(serde_json::Value::as_str) != Some("chatgpt") {
+            return Err(HandoffError::Preflight(
+                "Codex did not verify ChatGPT authentication".into(),
+            ));
+        }
+        let updated_auth = session.read_auth()?;
+        parse_auth(&updated_auth)?;
+        Ok(updated_auth)
     }
 }
 
@@ -691,129 +611,46 @@ impl AppServerUsageReader {
 impl UsageReader for AppServerUsageReader {
     fn read(&self, auth: &[u8]) -> Result<(UsageReport, Vec<u8>), HandoffError> {
         parse_auth(auth)?;
-        let temporary = tempfile::tempdir()?;
-        let auth_path = temporary.path().join("auth.json");
-        fs::write(&auth_path, auth)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let mut session = AppServerSession::start(
+            &self.codex_binary,
+            auth,
+            AppServerOperation::Usage,
+            Duration::from_secs(45),
+        )?;
+        session.initialize()?;
+        let account = session.request(
+            2,
+            serde_json::json!({
+                "method":"account/read",
+                "id":2,
+                "params":{"refreshToken":true}
+            }),
+        )?;
+        if account.get("error").is_some() {
+            return Err(usage_rpc_error(
+                "Codex rejected the authentication refresh",
+                &account,
+            ));
         }
-        let mut child = Command::new(&self.codex_binary)
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", temporary.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                HandoffError::Usage(format!("could not start Codex app-server: {error}"))
-            })?;
-        let report = (|| {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| HandoffError::Usage("could not open app-server stdin".into()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| HandoffError::Usage("could not open app-server stdout".into()))?;
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    let response = line.map_err(HandoffError::Io).and_then(|line| {
-                        serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
-                            HandoffError::Usage(format!("invalid app-server response: {error}"))
-                        })
-                    });
-                    if sender.send(response).is_err() {
-                        break;
-                    }
-                }
-            });
-            let receive = |expected_id| loop {
-                match receiver.recv_timeout(Duration::from_secs(45)) {
-                    Ok(Ok(message))
-                        if message.get("id").and_then(serde_json::Value::as_i64)
-                            == Some(expected_id) =>
-                    {
-                        break Ok(message);
-                    }
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(error)) => break Err(error),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        break Err(HandoffError::Usage(
-                            "Codex app-server timed out while reading usage".into(),
-                        ));
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        break Err(HandoffError::Usage(
-                            "Codex app-server ended before returning usage".into(),
-                        ));
-                    }
-                }
-            };
-
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({
-                    "method":"initialize",
-                    "id":1,
-                    "params":{"clientInfo":{"name":"codex-handoff","title":"Codex Handoff","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}
-                })
-            )?;
-            let initialized = receive(1)?;
-            if initialized.get("error").is_some() {
-                return Err(HandoffError::Usage(
-                    "Codex app-server rejected initialization".into(),
-                ));
-            }
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({"method":"initialized","params":{}})
-            )?;
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({
-                    "method":"account/read",
-                    "id":2,
-                    "params":{"refreshToken":true}
-                })
-            )?;
-            let account = receive(2)?;
-            if account.get("error").is_some() {
-                return Err(usage_rpc_error(
-                    "Codex rejected the authentication refresh",
-                    &account,
-                ));
-            }
-            parse_auth(&fs::read(&auth_path)?)?;
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({"method":"account/rateLimits/read","id":3})
-            )?;
-            let response = receive(3)?;
-            if response.get("error").is_some() {
-                return Err(usage_rpc_error(
-                    "Codex rejected the usage request",
-                    &response,
-                ));
-            }
-            let report =
-                parse_usage_report(response.get("result").ok_or_else(|| {
-                    HandoffError::Usage("Codex returned no usage result".into())
-                })?)?;
-            let updated_auth = fs::read(&auth_path)?;
-            parse_auth(&updated_auth)?;
-            Ok((report, updated_auth))
-        })();
-        let _ = child.kill();
-        let _ = child.wait();
-        report
+        parse_auth(&session.read_auth()?)?;
+        let response = session.request(
+            3,
+            serde_json::json!({"method":"account/rateLimits/read","id":3}),
+        )?;
+        if response.get("error").is_some() {
+            return Err(usage_rpc_error(
+                "Codex rejected the usage request",
+                &response,
+            ));
+        }
+        let report = parse_usage_report(
+            response
+                .get("result")
+                .ok_or_else(|| HandoffError::Usage("Codex returned no usage result".into()))?,
+        )?;
+        let updated_auth = session.read_auth()?;
+        parse_auth(&updated_auth)?;
+        Ok((report, updated_auth))
     }
 }
 
