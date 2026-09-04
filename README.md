@@ -24,6 +24,10 @@ ch add
 # Review every saved account and its current quota.
 ch list
 
+# Work offline or ask which healthy profile has the most quota remaining.
+ch list --offline
+ch best
+
 # Safely move the live Codex session to a profile.
 ch switch work
 
@@ -40,21 +44,28 @@ email address. For example, `litesky+codex@example.com` becomes
 | Command | Description |
 | --- | --- |
 | `ch init` | Save the existing live `auth.json` as the first profile. |
-| `ch add [-f]` | Run official `codex login`, save the new profile, then restore the previously live account. |
+| `ch add [--name <alias>] [-f]` | Run official `codex login`, optionally save under an alias, then restore the previously live account. |
 | `ch relogin <name> [-f]` | Replace one saved profile using the official login flow. |
-| `ch list` | Show all profiles, local health, and quota dashboards. |
+| `ch rename <current> <new-name>` | Rename an idle profile and update its metadata. |
+| `ch remove <name> [--yes]` | Permanently remove a non-active, idle profile after confirmation. |
+| `ch list [--offline] [--concurrency 1..16]` | Show all profiles; offline mode performs local checks only. |
 | `ch status` | Show the active live profile, its quota, and configured paths. |
 | `ch switch <name> [--force / --close-clients]` | Verify a profile online, sync the current one, then atomically activate it. |
 | `ch run <name> [-- <codex args>...]` | Start Codex with the selected profile; the active profile uses the default `CODEX_HOME`, while other profiles use their persistent profile home. |
 | `ch sync [-f]` | Save the latest live token refresh back to the active profile. |
-| `ch hi [prompt]` | Send a prompt ("hi" by default) to Codex across all saved accounts. |
-| `ch doctor` | Check the Codex CLI, vault consistency, permissions, locks, and running clients. |
+| `ch best [--concurrency 1..16]` | Recommend an eligible profile by current quota without switching accounts. |
+| `ch hi [prompt] [--concurrency 1..16] [--timeout <seconds>]` | Send a bounded prompt ("hi" by default) across all saved accounts. |
+| `ch doctor` | Check the Codex CLI, local app-server handshake, vault consistency, permissions, locks, and running clients. |
 
 `-f` / `--force` bypasses only the running-client check. It never bypasses
 file validation or online authentication verification. `-c` /
 `--close-clients` is available on `switch`; it asks only the default
 Codex/ChatGPT lane to quit, then waits up to five seconds. A `ch run` session
 for the target profile must be ended manually. `-f` and `-c` cannot be combined.
+
+`remove` is intentionally stricter: the active profile and any profile with a
+running isolated session cannot be deleted. Non-interactive callers must pass
+`--yes`; removal is permanent and does not affect the live account.
 
 ## Parallel CLI sessions
 
@@ -106,9 +117,37 @@ non-active profile that is currently running through `ch`. If one account's remo
 query fails, `ch` displays `Usage unavailable` for that profile without affecting
 the other accounts or any switching operation.
 
+`list` and `hi` run at most four profile operations concurrently by default.
+Use `--concurrency` to select 1–16 workers. Usage app-server sessions have a
+fixed 45-second deadline; `hi` has a 120-second per-profile deadline by default
+and supports `--timeout`. Results remain sorted by profile name regardless of
+completion order.
+
+`ch best` considers only locally healthy profiles with an available primary
+quota window and no reached quota or spend-control limit. It prefers the
+`codex` bucket, then `default`, then a sole bucket, and ranks by primary usage,
+secondary usage, earliest primary reset, and profile name. A missing secondary
+window ranks after a present one. `ch run best` launches the recommendation in
+the same isolated mode as `ch run <name>` and never changes the active profile.
+
 Color is enabled only in an interactive terminal. Piped or redirected output,
 and environments with `NO_COLOR` set, remain plain text with no ANSI escape
 codes.
+
+## Machine-readable output
+
+Pass the global `--json` option to `list`, `status`, `doctor`, or `best` for a
+stable JSON document with `schema_version: 1`.
+
+```sh
+ch --json list --offline
+ch --json doctor
+ch --json best
+```
+
+Partial remote failures stay in the document instead of hiding other profiles.
+`best` exits with status 2 when no profile is eligible; `doctor` exits with
+status 1 when a check fails.
 
 ## Paths and configuration
 
@@ -132,6 +171,8 @@ CODEX_HOME=/tmp/codex CODEX_HANDOFF_HOME=/tmp/codex-handoff ch status
 - Vault and profile directories use `0700`; auth, metadata, state, and lock
   files use `0600`.
 - Profile names are validated to prevent path traversal.
+- Sensitive profile files and directories reject symbolic links instead of
+  following them.
 - Before `switch`, `ch` starts `codex app-server --stdio` in a temporary home,
   refreshes and verifies the target account, and rejects email mismatches.
 - Updates use same-directory temporary files, `fsync`, atomic rename, rollback
@@ -147,10 +188,10 @@ chmod 600 ~/.codex/auth.json
 chmod 700 ~/.codex-handoff ~/.codex-handoff/profiles ~/.codex-handoff/profiles/*
 ```
 
-This first release deliberately does not delete profiles, rotate accounts,
-keep tokens alive, synchronize vaults between machines, or restart Codex
-Desktop. Use only accounts you are authorized to access and keep normal
-machine backups.
+This release deliberately does not automatically rotate accounts, switch as a
+side effect of recommendation, keep tokens alive, synchronize vaults between
+machines, or restart Codex Desktop. Use only accounts you are authorized to
+access and keep normal machine backups.
 
 ## Development
 
