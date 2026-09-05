@@ -13,6 +13,8 @@ use std::{
 
 mod presentation;
 
+const CODEX_YOLO_ARG: &str = "--dangerously-bypass-approvals-and-sandbox";
+
 #[derive(Parser)]
 #[command(
     name = "ch",
@@ -104,9 +106,19 @@ enum Command {
     /// Run Codex in an isolated profile home; use `best` for a recommendation.
     Run {
         name: String,
+        /// Skip Codex approval prompts and sandboxing. EXTREMELY DANGEROUS.
+        #[arg(short, long)]
+        yolo: bool,
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+}
+
+fn codex_args(yolo: bool, mut args: Vec<OsString>) -> Vec<OsString> {
+    if yolo {
+        args.insert(0, CODEX_YOLO_ARG.into());
+    }
+    args
 }
 
 fn main() -> ExitCode {
@@ -290,7 +302,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             )?;
             println!("{}", presentation::render_hi_results(&results, &prompt));
         }
-        Command::Run { name, args } => {
+        Command::Run { name, yolo, args } => {
             let name = if name == "best" {
                 let recommendation = app.best(4)?;
                 let Some(name) = recommendation.profile else {
@@ -301,6 +313,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             } else {
                 ProfileName::parse(name)?
             };
+            let args = codex_args(yolo, args);
             return Ok(exit_code(app.run_profile(&name, &args)?));
         }
     }
@@ -337,4 +350,46 @@ fn exit_code(status: ExitStatus) -> ExitCode {
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(1),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, codex_args};
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn run_accepts_short_and_long_yolo_flags() {
+        for (profile, flag) in [("work", "-y"), ("best", "--yolo")] {
+            let cli = Cli::try_parse_from(["ch", "run", profile, flag]).unwrap();
+
+            let Command::Run { name, yolo, args } = cli.command else {
+                panic!("expected run command");
+            };
+            assert_eq!(name, profile);
+            assert!(yolo);
+            assert!(args.is_empty());
+        }
+    }
+
+    #[test]
+    fn run_leaves_forwarded_arguments_unchanged_by_default() {
+        let args = vec![OsString::from("exec"), OsString::from("hello")];
+
+        assert_eq!(codex_args(false, args.clone()), args);
+    }
+
+    #[test]
+    fn run_prepends_the_native_codex_yolo_argument() {
+        let args = vec![OsString::from("exec"), OsString::from("hello")];
+
+        assert_eq!(
+            codex_args(true, args),
+            vec![
+                OsString::from("--dangerously-bypass-approvals-and-sandbox"),
+                OsString::from("exec"),
+                OsString::from("hello"),
+            ]
+        );
+    }
 }

@@ -51,7 +51,7 @@ email address. For example, `litesky+codex@example.com` becomes
 | `ch list [--offline] [--concurrency 1..16]` | Show all profiles; offline mode performs local checks only. |
 | `ch status` | Show the active live profile, its quota, and configured paths. |
 | `ch switch <name> [--force / --close-clients]` | Verify a profile online, sync the current one, then atomically activate it. |
-| `ch run <name> [-- <codex args>...]` | Start Codex with the selected profile; the active profile uses the default `CODEX_HOME`, while other profiles use their persistent profile home. |
+| `ch run <name> [-y / --yolo] [-- <codex args>...]` | Start Codex with the selected profile; optionally bypass Codex approvals and sandboxing. The active profile uses the default `CODEX_HOME`, while other profiles use their persistent profile home. |
 | `ch sync [-f]` | Save the latest live token refresh back to the active profile. |
 | `ch best [--concurrency 1..16]` | Recommend an eligible profile by current quota without switching accounts. |
 | `ch hi [prompt] [--concurrency 1..16] [--timeout <seconds>]` | Send a bounded prompt ("hi" by default) across all saved accounts. |
@@ -78,7 +78,13 @@ invocation, and existing scripts.
 # Separate terminals can use separate profiles at the same time.
 ch run personal
 ch run work -- -C ~/src/client --no-alt-screen
+ch run work --yolo
 ```
+
+`-y` / `--yolo` expands to Codex's
+`--dangerously-bypass-approvals-and-sandbox` option. It disables approval
+prompts and sandboxing for that Codex process, so use it only in an externally
+sandboxed environment.
 
 For the active profile, `ch run` deliberately uses the normal default
 `CODEX_HOME`; it behaves exactly like launching `codex` directly and can share
