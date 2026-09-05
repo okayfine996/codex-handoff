@@ -11,11 +11,13 @@ notifications arrive.
 
 ## Decision
 
-Use one internal app-server session module to own the private temporary home,
-0600 auth file, initialize handshake, response routing, fixed operation
-deadline, and child cleanup. Public probe and usage-reader types remain thin
-adapters. Doctor's compatibility check performs only the local initialize
-handshake; it does not issue account or quota requests.
+Use one internal app-server session module to own the initialize handshake,
+response routing, fixed operation deadline, and child cleanup. The caller
+supplies the authoritative profile `CODEX_HOME`; the session does not copy or
+rewrite authentication. Public probe and usage-reader types remain thin
+adapters. Doctor's compatibility check is the only app-server operation that
+uses an isolated temporary home, and it performs only the local initialize
+handshake without account or quota requests.
 
 ## Consequences
 

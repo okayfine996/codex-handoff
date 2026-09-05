@@ -44,8 +44,8 @@ email address. For example, `litesky+codex@example.com` becomes
 | Command | Description |
 | --- | --- |
 | `ch init` | Save the existing live `auth.json` as the first profile. |
-| `ch add [--name <alias>] [-f]` | Run official `codex login`, optionally save under an alias, then restore the previously live account. |
-| `ch relogin <name> [-f]` | Replace one saved profile using the official login flow. |
+| `ch add [--name <alias>] [-f]` | Run official `codex login` in a private staging home and save the new account without changing the live account. |
+| `ch relogin <name> [-f]` | Replace one saved profile using the official login flow in that profile's persistent home. |
 | `ch rename <current> <new-name>` | Rename an idle profile and update its metadata. |
 | `ch remove <name> [--yes]` | Permanently remove a non-active, idle profile after confirmation. |
 | `ch list [--offline] [--concurrency 1..16]` | Show all profiles; offline mode performs local checks only. |
@@ -94,11 +94,21 @@ directory is its persistent `CODEX_HOME`. On the first such `run`, `ch` copies
 later changes are profile-specific. It never copies authentication, session
 history, or plugin installations.
 
+The same home selection applies to every Codex operation bound to an existing
+profile: `list`, `status`, `best`, `hi`, `switch`, `run`, and `relogin`. The
+active profile's authoritative authentication file is the global
+`CODEX_HOME/auth.json`; an inactive profile's authoritative file is
+`profiles/<name>/auth.json`. These commands do not copy authentication into a
+temporary home. If Codex rotates a refresh token, it therefore updates the
+authoritative file directly; active-profile changes are then mirrored into the
+vault copy.
+
 Native Codex supports multiple instances of one account, so active-profile
 sessions are not artificially serialized. Non-active sessions for the same
-profile also run concurrently, but `ch` holds a shared runtime lock while they
-run: `list` and `hi` report that profile as busy instead of refreshing its auth
-file concurrently.
+profile also run concurrently. `run`, `list`, and `hi` use compatible shared
+runtime leases, so quota reads and prompts continue to work while that profile
+is in use. Commands that move, replace, rename, or remove a profile require an
+exclusive lease.
 
 `switch` remains necessary because Codex Desktop and a plain `codex` invocation
 always use the default home. It blocks only the default lane (the current active
@@ -107,21 +117,20 @@ sessions keep running. `--close-clients` closes only the default lane.
 
 ## Quota dashboard
 
-`ch list` queries each locally healthy profile in an isolated temporary
-`CODEX_HOME`, then displays its 5-hour and weekly windows as progress bars.
+`ch list` queries each locally healthy profile in its persistent `CODEX_HOME`,
+then displays its 5-hour and weekly windows as progress bars.
 Green means less than 50% used, yellow 50–79%, and red 80% or more. The output
 also shows reset times, reached limits, spend-control warnings, and available
 reset credits.
 
-`ch status` uses the same dashboard for only the active live account. When a quota
-query or `hi` prompt triggers a credential refresh, `ch` automatically persists the
-updated tokens back to the vault profile (and the live `auth.json` for the active
-account) to keep OAuth refresh token rotations in sync. To avoid racing an active
-client, `status`, `list`, and `hi` do not run a temporary refresh for the default
-account while Codex or ChatGPT is running; `list` and `hi` similarly skip a
-non-active profile that is currently running through `ch`. If one account's remote
-query fails, `ch` displays `Usage unavailable` for that profile without affecting
-the other accounts or any switching operation.
+`ch status` uses the same dashboard for only the active live account. Usage
+queries can run while Codex or ChatGPT is using the active home; they request
+current account and rate-limit data without proactively forcing a token refresh.
+If Codex nevertheless refreshes credentials, `ch` mirrors the final active auth
+back to its vault profile. `hi` can likewise share the authoritative home with
+an existing Codex client or `ch run` session. If one account's remote query
+fails, `ch` displays `Usage unavailable` for that profile without affecting the
+other accounts or any switching operation.
 
 `list` and `hi` run at most four profile operations concurrently by default.
 Use `--concurrency` to select 1–16 workers. Usage app-server sessions have a
@@ -179,12 +188,14 @@ CODEX_HOME=/tmp/codex CODEX_HANDOFF_HOME=/tmp/codex-handoff ch status
 - Profile names are validated to prevent path traversal.
 - Sensitive profile files and directories reject symbolic links instead of
   following them.
-- Before `switch`, `ch` starts `codex app-server --stdio` in a temporary home,
-  refreshes and verifies the target account, and rejects email mismatches.
+- Before `switch`, `ch` starts `codex app-server --stdio` in the target profile's
+  authoritative home, refreshes and verifies the account, and rejects email
+  mismatches.
 - Updates use same-directory temporary files, `fsync`, atomic rename, rollback
   snapshots, and an OS advisory lock.
-- `add` and `relogin` never call `logout`; they temporarily preserve and then
-  restore the active account.
+- `add` never calls `logout` or replaces the live auth; it logs in through a
+  private staging home. `relogin` operates in the target profile's authoritative
+  home and restores its original auth if login fails.
 
 If `doctor` reports insecure credentials, remove group/other permissions from
 the affected file before retrying. For the default paths:

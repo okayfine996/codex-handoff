@@ -1,9 +1,8 @@
 use crate::HandoffError;
 use serde_json::Value;
 use std::{
-    fs,
     io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
@@ -40,8 +39,6 @@ impl Operation {
 }
 
 pub(crate) struct AppServerSession {
-    _home: tempfile::TempDir,
-    auth_path: PathBuf,
     child: Child,
     stdin: ChildStdin,
     receiver: Receiver<Result<Value, String>>,
@@ -52,25 +49,16 @@ pub(crate) struct AppServerSession {
 impl AppServerSession {
     pub(crate) fn start(
         codex_binary: &Path,
-        auth: &[u8],
+        codex_home: &Path,
         operation: Operation,
         timeout: Duration,
     ) -> Result<Self, HandoffError> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| operation.error("app-server timeout is too large"))?;
-        let home = tempfile::tempdir()?;
-        let auth_path = home.path().join("auth.json");
-        fs::write(&auth_path, auth)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
-        }
-
         let mut child = Command::new(codex_binary)
             .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", home.path())
+            .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -107,8 +95,6 @@ impl AppServerSession {
         });
 
         Ok(Self {
-            _home: home,
-            auth_path,
             child,
             stdin,
             receiver,
@@ -163,10 +149,6 @@ impl AppServerSession {
 
     pub(crate) fn notify(&mut self, notification: Value) -> Result<(), HandoffError> {
         self.write(notification)
-    }
-
-    pub(crate) fn read_auth(&self) -> Result<Vec<u8>, HandoffError> {
-        Ok(fs::read(&self.auth_path)?)
     }
 
     fn write(&mut self, message: Value) -> Result<(), HandoffError> {
